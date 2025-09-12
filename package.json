@@ -9,7 +9,7 @@
     "brain": "ts-node src/brain.ts"
   },
   "bin": {
-    "brain": "./dist/brain.js"
+    "brain": "ts-node -r dotenv/config src/brain.ts"
   },
   "keywords": [],
   "author": "",
@@ -24,6 +24,7 @@
     "openai": "^5.20.1",
     "pg": "^8.16.3",
     "pgvector": "^0.2.1",
+    "simple-git": "^3.28.0",
     "tree-sitter": "^0.21.1",
     "tree-sitter-typescript": "^0.23.2"
   },
