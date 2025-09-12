@@ -8,7 +8,7 @@
     "dev": "tsx watch src/server.ts",
     "brain": "ts-node src/brain.ts"
   },
-   "bin": {
+  "bin": {
     "brain": "ts-node -r dotenv/config ./brain.ts"
   },
   "keywords": [],
@@ -17,6 +17,7 @@
   "description": "",
   "dependencies": {
     "commander": "^14.0.1",
+    "cors": "^2.8.5",
     "dotenv": "^17.2.2",
     "express": "^5.1.0",
     "gitignore-parser": "^0.0.2",
@@ -29,6 +30,7 @@
     "tree-sitter-typescript": "^0.23.2"
   },
   "devDependencies": {
+    "@types/cors": "^2.8.19",
     "@types/express": "^5.0.3",
     "@types/gitignore-parser": "^0.0.3",
     "@types/node": "^24.3.1",
