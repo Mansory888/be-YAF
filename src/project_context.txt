@@ -1,0 +1,473 @@
+Project file structure:
+=======================
+./
+    brain.ts
+    server.ts
+    core/
+        chunker.ts
+    scripts/
+        ingest.ts
+
+
+File Contents:
+===============
+
+
+--- FILE: brain.ts ---
+
+#!/usr/bin/env node
+// --- FILE: brain.ts ---
+
+import 'dotenv/config';
+import { Command } from 'commander';
+import { Client } from 'pg';
+import pgvector from 'pgvector/pg';
+import OpenAI from 'openai';
+import { runIngestion } from './scripts/ingest';
+
+// --- CONFIGURATION ---
+const connectionString = process.env.DATABASE_URL!;
+const openaiApiKey = process.env.OPENAI_API_KEY!;
+
+if (!connectionString || !openaiApiKey) {
+    throw new Error("FATAL: Missing environment variables DATABASE_URL or OPENAI_API_KEY");
+}
+const openai = new OpenAI({ apiKey: openaiApiKey });
+const program = new Command();
+
+// --- HELPER FUNCTIONS ---
+async function getEmbedding(text: string): Promise<number[]> {
+  const response = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: text.replace(/\n/g, ' '),
+  });
+  return response.data[0].embedding;
+}
+
+// --- CLI COMMAND DEFINITIONS ---
+
+// The `ingest` command
+program
+  .command('ingest')
+  .description('Ingest and index a project codebase into the brain.')
+  .action(async () => {
+    try {
+      await runIngestion();
+      console.log('✅ Ingestion complete.');
+    } catch (error) {
+      console.error('❌ Ingestion failed:', error);
+      process.exit(1);
+    }
+  });
+
+// The `ask` command
+program
+  .command('ask')
+  .description('Ask a question about the indexed codebase.')
+  .argument('<question>', 'The question to ask')
+  .action(async (question: string) => {
+    console.log(`🧠 Thinking about: "${question}"`);
+    const client = new Client({ connectionString });
+    try {
+      await client.connect();
+      await pgvector.registerType(client);
+
+      const questionEmbedding = await getEmbedding(question);
+
+      // CRITICAL: Two-Stage Retrieval
+      // Stage 1: Find the most relevant files using summary embeddings.
+      const { rows: relevantFiles } = await client.query(
+        `SELECT id, path, summary FROM indexed_files ORDER BY summary_embedding <=> $1 LIMIT 5`,
+        [pgvector.toSql(questionEmbedding)]
+      );
+      
+      if (relevantFiles.length === 0) {
+        console.log("I couldn't find any relevant files to answer that question.");
+        return;
+      }
+      
+      console.log(`\n🔍 Found relevant files: ${relevantFiles.map(f => f.path).join(', ')}`);
+      const relevantFileIds = relevantFiles.map(f => f.id);
+
+      // Stage 2: Find the most relevant chunks WITHIN those files.
+      const { rows: contextChunks } = await client.query(
+        `SELECT file_id, content, chunk_name 
+         FROM code_chunks 
+         WHERE file_id = ANY($1::int[])
+         ORDER BY embedding <=> $2 
+         LIMIT 10`,
+        [relevantFileIds, pgvector.toSql(questionEmbedding)]
+      );
+
+      if (contextChunks.length === 0) {
+        console.log("I found some relevant files, but couldn't pinpoint specific code snippets to answer your question.");
+        return;
+      }
+
+      // Synthesize the final answer
+      const contextString = contextChunks.map(c => {
+        const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
+        return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
+      }).join('\n\n');
+
+      const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided code context. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
+      const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
+
+      const stream = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+        stream: true,
+      });
+      
+      console.log('\n💬 Answer:\n');
+      for await (const chunk of stream) {
+        process.stdout.write(chunk.choices[0]?.delta?.content || '');
+      }
+      console.log('\n');
+
+    } catch (error) {
+      console.error('❌ An error occurred:', error);
+    } finally {
+      await client.end();
+    }
+  });
+
+program.parse(process.argv);
+
+--- FILE: server.ts ---
+
+import 'dotenv/config';
+import express from 'express';
+import path from 'path';
+import { Client } from 'pg';
+import OpenAI from 'openai';
+import pgvector from 'pgvector/pg'; // ✅ correct import
+
+// --- CONFIGURATION & VALIDATION ---
+const app = express();
+const port = 3000;
+const connectionString = process.env.DATABASE_URL!;
+const openaiApiKey = process.env.OPENAI_API_KEY!;
+
+if (!connectionString || !openaiApiKey) {
+    throw new Error("FATAL: Missing environment variables DATABASE_URL or OPENAI_API_KEY");
+}
+const openai = new OpenAI({ apiKey: openaiApiKey });
+
+// --- MIDDLEWARE ---
+app.use(express.json());
+app.use(express.static(path.join(process.cwd(), 'public')));
+
+// --- HELPER FUNCTION ---
+async function getEmbedding(text: string): Promise<number[]> {
+  const response = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: text.replace(/\n/g, ' '),
+  });
+  return response.data[0].embedding;
+}
+
+// --- API ENDPOINT ---
+app.post('/api/ask', async (req, res) => {
+    const { question } = req.body;
+    if (!question) {
+        return res.status(400).json({ error: 'Question is required.' });
+    }
+    console.log(`Received question: ${question}`);
+
+    const client = new Client({ connectionString });
+    try {
+        await client.connect();
+
+        // ✅ REGISTER THE VECTOR TYPE FOR THE QUERY
+        await pgvector.registerType(client);
+        
+        const questionEmbedding = await getEmbedding(question);
+
+        console.log('Querying for similar chunks...');
+        const { rows: contextChunks } = await client.query(
+            `SELECT file_path, content, embedding <=> $1 AS distance
+             FROM code_chunks
+             ORDER BY distance
+             LIMIT 10`,
+            [pgvector.toSql(questionEmbedding)] // ✅ USE THE HELPER TO FORMAT THE VECTOR
+        );
+        
+        console.log(`Found ${contextChunks.length} relevant chunks.`);
+        if (contextChunks.length > 0) {
+            console.log('Top result distance:', contextChunks[0].distance);
+        }
+
+        if (contextChunks.length === 0) {
+            return res.json({ answer: "I couldn't find any relevant context in the codebase to answer that." });
+        }
+
+        const contextString = contextChunks.map(c => `--- FILE: ${c.file_path} ---\n\n${c.content}`).join('\n\n');
+        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided code context. Be concise and accurate. Format code blocks using Markdown. If the context is insufficient, say so.`;
+        const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
+
+        const stream = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+            stream: true,
+        });
+
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        for await (const chunk of stream) {
+            res.write(chunk.choices[0]?.delta?.content || '');
+        }
+        res.end();
+    } catch (error) {
+        console.error('Error in /api/ask:', error);
+        res.status(500).json({ error: 'An internal server error occurred.' });
+    } finally {
+        // Ensure the client is always closed
+        if (client) {
+            await client.end();
+        }
+    }
+});
+
+// --- START SERVER ---
+app.listen(port, () => {
+    console.log(`🧠 AI Project Brain is listening at http://localhost:${port}`);
+});
+
+--- FILE: core/chunker.ts ---
+
+// --- FILE: core/chunker.ts ---
+import Parser from 'tree-sitter';
+import TypeScript from 'tree-sitter-typescript/typescript';
+
+export interface CodeChunk {
+  content: string;
+  metadata: {
+    type: 'function' | 'class' | 'method' | 'arrow_function' | 'block';
+    name: string;
+    start_line: number;
+    end_line: number;
+  };
+}
+
+const parser = new Parser();
+parser.setLanguage(TypeScript);
+
+// CRITICAL: This query identifies the distinct, semantic blocks of code.
+const TS_QUERY = `
+[
+  (function_declaration) @chunk
+  (class_declaration) @chunk
+  (method_definition) @chunk
+  (lexical_declaration 
+    (variable_declarator 
+      value: (arrow_function)
+    )
+  ) @chunk
+]
+`;
+
+export function chunkCodeWithAST(content: string): CodeChunk[] {
+  const tree = parser.parse(content);
+  const query = TypeScript.query(TS_QUERY);
+  const matches = query.captures(tree.rootNode);
+
+  const chunks: CodeChunk[] = [];
+
+  for (const match of matches) {
+    const node = match.node;
+    let name = 'anonymous';
+    let type: CodeChunk['metadata']['type'] = 'block';
+
+    // Heuristics to find the name of the chunk
+    if (node.type === 'function_declaration' || node.type === 'class_declaration' || node.type === 'method_definition') {
+        name = node.childForFieldName('name')?.text || 'anonymous';
+        if (node.type === 'method_definition') type = 'method';
+        else if (node.type === 'class_declaration') type = 'class';
+        else type = 'function';
+    } else if (node.type === 'lexical_declaration') {
+        // For arrow functions like `const myFunc = () => ...`
+        name = node.firstNamedChild?.firstNamedChild?.text || 'anonymous_arrow_function';
+        type = 'arrow_function';
+    }
+    
+    chunks.push({
+      content: node.text,
+      metadata: {
+        type: type,
+        name: name,
+        start_line: node.startPosition.row + 1,
+        end_line: node.endPosition.row + 1,
+      },
+    });
+  }
+
+  // Fallback: If no specific chunks were found (e.g., a simple config file),
+  // treat the entire file as a single chunk.
+  if (chunks.length === 0 && content.trim().length > 0) {
+    chunks.push({
+      content: content,
+      metadata: {
+        type: 'block',
+        name: 'file_content',
+        start_line: 1,
+        end_line: content.split('\n').length,
+      },
+    });
+  }
+
+  return chunks;
+}
+
+--- FILE: scripts/ingest.ts ---
+
+// --- FILE: scripts/ingest.ts ---
+
+import 'dotenv/config';
+import { glob } from 'glob';
+import fs from 'fs';
+import path from 'path';
+import crypto from 'crypto';
+import { Client } from 'pg';
+import OpenAI from 'openai';
+import gitignore from 'gitignore-parser';
+import pgvector from 'pgvector/pg';
+import { chunkCodeWithAST } from '../core/chunker'; // UPDATED to new chunker
+
+// --- CONFIGURATION ---
+const PROJECT_PATH = process.env.PROJECT_TO_INDEX!;
+const connectionString = process.env.DATABASE_URL!;
+const openaiApiKey = process.env.OPENAI_API_KEY!;
+
+if (!PROJECT_PATH || !connectionString || !openaiApiKey) {
+  throw new Error('FATAL: Missing environment variables PROJECT_TO_INDEX, DATABASE_URL, or OPENAI_API_KEY');
+}
+
+const openai = new OpenAI({ apiKey: openaiApiKey });
+const IGNORED_EXTENSIONS = new Set(['.lock', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.ico']);
+const IGNORED_FILENAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
+
+// --- CORE HELPER FUNCTIONS ---
+async function getEmbedding(text: string): Promise<number[]> {
+  const response = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: text.replace(/\n/g, ' '),
+  });
+  return response.data[0].embedding;
+}
+
+// NEW: Summarization Function
+async function summarizeFile(filePath: string, content: string): Promise<string> {
+    const prompt = `You are an expert software architect. Summarize the purpose and core responsibility of the following code file in one or two sentences. Focus on the high-level role of the file, not the specifics of each function.
+    
+    File Path: ${filePath}
+    
+    Code:
+    ---
+    ${content}
+    ---
+    
+    One-sentence summary:`;
+    
+    try {
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [{ role: 'user', content: prompt }],
+            max_tokens: 100,
+            temperature: 0.1,
+        });
+        return response.choices[0].message.content?.trim() || "Could not generate a summary.";
+    } catch (error) {
+        console.error(`  - Failed to summarize ${filePath}:`, error);
+        return "Summary generation failed.";
+    }
+}
+
+
+// --- MAIN INGESTION LOGIC ---
+export async function runIngestion() {
+  console.log(`[1/4] Starting ingestion for project: ${PROJECT_PATH}`);
+  const client = new Client({ connectionString });
+  await client.connect();
+  await pgvector.registerType(client);
+
+  try {
+    const gitignorePath = path.join(PROJECT_PATH, '.gitignore');
+    const ignore = fs.existsSync(gitignorePath)
+      ? gitignore.compile(fs.readFileSync(gitignorePath, 'utf8'))
+      : { accepts: (_p: string) => true };
+
+    const allFiles = await glob('**/*', { cwd: PROJECT_PATH, nodir: true, dot: true, ignore: ['**/node_modules/**', '**/.git/**'] });
+    const filesToIndex = allFiles.filter(file => {
+      const ext = path.extname(file);
+      const filename = path.basename(file);
+      return ignore.accepts(file) && !IGNORED_EXTENSIONS.has(ext) && !IGNORED_FILENAMES.has(filename);
+    });
+
+    console.log(`[2/4] Found ${filesToIndex.length} files to process.`);
+    let processedCount = 0;
+
+    for (const relativePath of filesToIndex) {
+      const fullPath = path.join(PROJECT_PATH, relativePath);
+      const content = fs.readFileSync(fullPath, 'utf-8');
+      if (!content.trim()) continue;
+
+      const hash = crypto.createHash('sha256').update(content).digest('hex');
+      const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE path = $1', [relativePath]);
+
+      if (rows.length > 0 && rows[0].content_hash === hash) {
+        continue; // Skip unchanged files
+      }
+
+      processedCount++;
+      console.log(`      Processing changed file: ${relativePath}`);
+
+      await client.query('BEGIN');
+      try {
+        // Clear old data for this file
+        await client.query('DELETE FROM indexed_files WHERE path = $1', [relativePath]);
+
+        // NEW: Summarize and embed summary
+        console.log(`        - Summarizing file...`);
+        const summary = await summarizeFile(relativePath, content);
+        const summaryEmbedding = await getEmbedding(summary);
+
+        // Insert file record and get its new ID
+        const fileInsertResult = await client.query(
+          'INSERT INTO indexed_files (path, content_hash, summary, summary_embedding, last_indexed_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id',
+          [relativePath, hash, summary, pgvector.toSql(summaryEmbedding)]
+        );
+        const fileId = fileInsertResult.rows[0].id;
+        
+        // UPDATED: Use the new AST-based chunker
+        const chunks = chunkCodeWithAST(content);
+        console.log(`        - Found ${chunks.length} semantic chunks.`);
+
+        // Embed and insert each chunk
+        for (const chunk of chunks) {
+          const chunkEmbedding = await getEmbedding(chunk.content);
+          await client.query(
+            `INSERT INTO code_chunks (file_id, chunk_name, chunk_type, content, start_line, end_line, embedding)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+            [
+              fileId,
+              chunk.metadata.name,
+              chunk.metadata.type,
+              chunk.content,
+              chunk.metadata.start_line,
+              chunk.metadata.end_line,
+              pgvector.toSql(chunkEmbedding),
+            ]
+          );
+        }
+        await client.query('COMMIT');
+      } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(`      Failed to process ${relativePath}:`, error);
+      }
+    }
+    console.log(`[3/4] Processed ${processedCount} new or changed files.`);
+  } finally {
+    console.log('[4/4] Ingestion complete.');
+    await client.end();
+  }
+}

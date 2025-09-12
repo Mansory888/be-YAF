@@ -1,0 +1,39 @@
+{
+  "name": "ai-project-brain",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "start": "node dist/server.js",
+    "build": "tsc",
+    "dev": "nodemon src/server.ts",
+    "brain": "ts-node src/brain.ts"
+  },
+  "bin": {
+    "brain": "./dist/brain.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "commander": "^14.0.1",
+    "dotenv": "^17.2.2",
+    "express": "^5.1.0",
+    "gitignore-parser": "^0.0.2",
+    "glob": "^11.0.3",
+    "openai": "^5.20.1",
+    "pg": "^8.16.3",
+    "pgvector": "^0.2.1",
+    "tree-sitter": "^0.21.1",
+    "tree-sitter-typescript": "^0.23.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/gitignore-parser": "^0.0.3",
+    "@types/node": "^24.3.1",
+    "@types/pg": "^8.15.5",
+    "nodemon": "^3.1.10",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.2"
+  }
+}
