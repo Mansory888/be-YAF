@@ -50,59 +50,50 @@ async function summarizeFile(filePath: string, content: string): Promise<string>
 }
 
 // --- MAIN INGESTION LOGIC ---
-export async function runIngestion(projectPath: string) {
+export async function runIngestion(projectId: number, projectPath: string) {
   const client = new Client({ connectionString });
   await client.connect();
   await pgvector.registerType(client);
   console.log('Database connection established.');
 
-  // FIX: Initialize simple-git here, using the provided projectPath.
   const git: SimpleGit = simpleGit(projectPath);
 
   try {
-    // FIX: Pass the projectPath to syncFiles.
-    await syncFiles(client, projectPath);
-    // FIX: Pass the initialized git instance to syncGitHistory.
-    await syncGitHistory(client, git);
+    await syncFiles(client, projectId, projectPath);
+    await syncGitHistory(client, projectId, git);
   } finally {
-    console.log('Ingestion complete. Closing database connection.');
+    console.log('Ingestion process finished. Closing database connection.');
     await client.end();
   }
 }
 
 // --- STAGE 1: Sync Filesystem State ---
-// FIX: Update function signature to accept projectPath.
-async function syncFiles(client: Client, projectPath: string) {
-  console.log(`[1/4] Starting file sync for project: ${projectPath}`);
+async function syncFiles(client: Client, projectId: number, projectPath: string) {
+  console.log(`[1/4] Starting file sync for project ID: ${projectId}`);
   
-  // --- NEW: PRUNING STEP ---
   console.log(`[2/4] Pruning deleted files from the database...`);
-  // Get all file paths currently in the database
-  const { rows: dbFiles } = await client.query('SELECT path FROM indexed_files');
+  const { rows: dbFiles } = await client.query('SELECT path FROM indexed_files WHERE project_id = $1', [projectId]);
   const dbPaths = new Set(dbFiles.map(f => f.path));
-
-  // Get all file paths currently on disk
+  
   const allDiskFiles = await glob('**/*', { cwd: projectPath, nodir: true, dot: true, ignore: ['**/node_modules/**', '**/.git/**'] });
   const diskPaths = new Set(allDiskFiles);
 
-  // Find paths that are in the DB but NOT on disk
   const pathsToDelete = [...dbPaths].filter(p => !diskPaths.has(p));
 
   if (pathsToDelete.length > 0) {
-    console.log(`      Found ${pathsToDelete.length} files to delete:`, pathsToDelete.join(', '));
-    await client.query('DELETE FROM indexed_files WHERE path = ANY($1::text[])', [pathsToDelete]);
+    console.log(`      Found ${pathsToDelete.length} files to delete.`);
+    await client.query('DELETE FROM indexed_files WHERE project_id = $1 AND path = ANY($2::text[])', [projectId, pathsToDelete]);
     console.log(`      -> Pruning complete.`);
   } else {
     console.log(`      -> No files to prune.`);
   }
-  // --- END OF PRUNING STEP ---
 
   const gitignorePath = path.join(projectPath, '.gitignore');
   const ignore = fs.existsSync(gitignorePath)
     ? gitignore.compile(fs.readFileSync(gitignorePath, 'utf8'))
     : { accepts: (_p: string) => true };
 
-  const filesToIndex = allDiskFiles.filter(file => { // Reuse the glob result
+  const filesToIndex = allDiskFiles.filter(file => {
     const ext = path.extname(file);
     const filename = path.basename(file);
     return ignore.accepts(file) && !IGNORED_EXTENSIONS.has(ext) && !IGNORED_FILENAMES.has(filename);
@@ -116,8 +107,8 @@ async function syncFiles(client: Client, projectPath: string) {
     const content = fs.readFileSync(fullPath, 'utf-8');
     if (!content.trim()) continue;
 
-    const hash = crypto.createHash('sha256').update(content).digest('hex');
-    const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE path = $1', [relativePath]);
+    const hash = crypto.createHash('sha265').update(content).digest('hex');
+    const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
 
     if (rows.length > 0 && rows[0].content_hash === hash) {
       continue;
@@ -128,12 +119,14 @@ async function syncFiles(client: Client, projectPath: string) {
 
     await client.query('BEGIN');
     try {
-      await client.query('DELETE FROM indexed_files WHERE path = $1', [relativePath]);
+      await client.query('DELETE FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
+      
       const summary = await summarizeFile(relativePath, content);
       const summaryEmbedding = await getEmbedding(summary);
+      
       const fileInsertResult = await client.query(
-        'INSERT INTO indexed_files (path, content_hash, summary, summary_embedding, last_indexed_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id',
-        [relativePath, hash, summary, pgvector.toSql(summaryEmbedding)]
+        'INSERT INTO indexed_files (project_id, path, content_hash, summary, summary_embedding, last_indexed_at) VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING id',
+        [projectId, relativePath, hash, summary, pgvector.toSql(summaryEmbedding)]
       );
       const fileId = fileInsertResult.rows[0].id;
       
@@ -155,15 +148,13 @@ async function syncFiles(client: Client, projectPath: string) {
 }
 
 // --- STAGE 2: Sync Git Commit History ---
-// FIX: Update function signature to accept the git instance.
-async function syncGitHistory(client: Client, git: SimpleGit) {
+async function syncGitHistory(client: Client, projectId: number, git: SimpleGit) {
     console.log('\n[1/3] Starting Git history sync...');
     
-    const { rows: existingCommits } = await client.query('SELECT commit_hash FROM commits');
+    const { rows: existingCommits } = await client.query('SELECT commit_hash FROM commits WHERE project_id = $1', [projectId]);
     const existingHashes = new Set(existingCommits.map(c => c.commit_hash));
     console.log(`[2/3] Found ${existingHashes.size} existing commits in the database.`);
 
-    // FIX: Use the passed git instance.
     const log = await git.log();
     const allCommits = [...log.all].reverse();
 
@@ -181,8 +172,8 @@ async function syncGitHistory(client: Client, git: SimpleGit) {
         try {
             const messageEmbedding = await getEmbedding(commit.message);
             const commitInsertResult = await client.query(
-                `INSERT INTO commits (commit_hash, author_name, author_email, commit_date, message, embedding) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-                [commit.hash, commit.author_name, commit.author_email, commit.date, commit.message, pgvector.toSql(messageEmbedding)]
+                `INSERT INTO commits (project_id, commit_hash, author_name, author_email, commit_date, message, embedding) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+                [projectId, commit.hash, commit.author_name, commit.author_email, commit.date, commit.message, pgvector.toSql(messageEmbedding)]
             );
             const commitId = commitInsertResult.rows[0].id;
             
@@ -195,7 +186,7 @@ async function syncGitHistory(client: Client, git: SimpleGit) {
                 const change_type = parts[0].trim();
                 const file_path = parts[1].trim();
                 
-                const { rows } = await client.query('SELECT id FROM indexed_files WHERE path = $1', [file_path]);
+                const { rows } = await client.query('SELECT id FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, file_path]);
 
                 if (rows.length > 0) {
                     const fileId = rows[0].id;
@@ -205,6 +196,22 @@ async function syncGitHistory(client: Client, git: SimpleGit) {
                     );
                 }
             }
+
+            // NEW: Check commit message for task-closing keywords
+            const taskRegex = /(?:closes|fixes|resolves)\s+#(\d+)/gi;
+            let match;
+            while ((match = taskRegex.exec(commit.message)) !== null) {
+                const taskNumber = parseInt(match[1], 10);
+                console.log(`      -> Found reference to close task #${taskNumber}.`);
+                const updateResult = await client.query(
+                    `UPDATE tasks SET status = 'done', updated_at = NOW() WHERE project_id = $1 AND task_number = $2 AND status != 'done'`,
+                    [projectId, taskNumber]
+                );
+                if (updateResult.rowCount && updateResult.rowCount > 0) {
+                    console.log(`      ✅ Automatically closed task #${taskNumber}.`);
+                }
+            }
+
             await client.query('COMMIT');
         } catch (error) {
             await client.query('ROLLBACK');

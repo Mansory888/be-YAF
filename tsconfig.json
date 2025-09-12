@@ -8,11 +8,11 @@
     "strict": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
-    "typeRoots": ["./types", "./node_modules/@types"]
+    "typeRoots": ["src/types", "./node_modules/@types"]
   },
   "files": [
-    "./types/tree-sitter-typescript.d.ts"
+    "src/types/tree-sitter-typescript.d.ts"
   ],
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "src/core"],
   "exclude": ["node_modules"]
 }

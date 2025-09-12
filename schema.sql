@@ -1,18 +1,28 @@
 -- Step 1: Enable the pgvector extension.
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- Step 2: Create a table for indexed files.
-CREATE TABLE indexed_files (
+-- NEW: Table for projects. This is the root of all data.
+CREATE TABLE projects (
   id SERIAL PRIMARY KEY,
-  path TEXT UNIQUE NOT NULL,
+  name TEXT NOT NULL,
+  source TEXT UNIQUE NOT NULL, -- The Git URL or unique local path
+  created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- MODIFIED: Link indexed_files to a project.
+CREATE TABLE IF NOT EXISTS indexed_files (
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, -- New
+  path TEXT NOT NULL,
   content_hash TEXT NOT NULL,
   summary TEXT,
   summary_embedding VECTOR(1536),
-  last_indexed_at TIMESTAMPTZ DEFAULT NOW()
+  last_indexed_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (project_id, path) -- Path is unique *within* a project
 );
 
--- Step 3: Create the table for code chunks.
-CREATE TABLE code_chunks (
+-- MODIFIED: code_chunks is implicitly linked via file_id. No changes needed.
+CREATE TABLE IF NOT EXISTS code_chunks (
   id SERIAL PRIMARY KEY,
   file_id INTEGER NOT NULL REFERENCES indexed_files(id) ON DELETE CASCADE,
   chunk_name TEXT,
@@ -23,19 +33,21 @@ CREATE TABLE code_chunks (
   embedding VECTOR(1536) NOT NULL
 );
 
--- Step 4: Create the table for Git commits.
-CREATE TABLE commits (
+-- MODIFIED: Link commits to a project.
+CREATE TABLE IF NOT EXISTS commits (
   id SERIAL PRIMARY KEY,
-  commit_hash TEXT UNIQUE NOT NULL,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE, -- New
+  commit_hash TEXT NOT NULL,
   author_name TEXT,
   author_email TEXT,
   commit_date TIMESTAMPTZ NOT NULL,
   message TEXT NOT NULL,
-  embedding VECTOR(1536)
+  embedding VECTOR(1536),
+  UNIQUE (project_id, commit_hash) -- Hash is unique *within* a project
 );
 
--- Step 5: Create a link table between commits and files.
-CREATE TABLE commit_files (
+-- MODIFIED: commit_files is implicitly linked. No changes needed.
+CREATE TABLE IF NOT EXISTS commit_files (
   id SERIAL PRIMARY KEY,
   commit_id INTEGER NOT NULL REFERENCES commits(id) ON DELETE CASCADE,
   file_id INTEGER NOT NULL REFERENCES indexed_files(id) ON DELETE CASCADE,
@@ -43,12 +55,32 @@ CREATE TABLE commit_files (
   UNIQUE (commit_id, file_id)
 );
 
--- Step 6: Create HNSW indexes for fast vector search.
-CREATE INDEX ON indexed_files USING HNSW (summary_embedding vector_l2_ops);
-CREATE INDEX ON code_chunks USING HNSW (embedding vector_l2_ops);
-CREATE INDEX ON commits USING HNSW (embedding vector_l2_ops);
+-- NEW: Table for tasks, ready for the Kanban board.
+CREATE TABLE tasks (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    task_number SERIAL, -- Project-specific task ID (#1, #2, etc.)
+    title TEXT NOT NULL,
+    description TEXT,
+    status TEXT NOT NULL DEFAULT 'open', -- e.g., 'open', 'in_progress', 'done'
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    UNIQUE (project_id, task_number)
+);
 
--- Step 7: Create B-tree indexes for faster joins.
-CREATE INDEX ON code_chunks (file_id);
-CREATE INDEX ON commit_files (commit_id);
-CREATE INDEX ON commit_files (file_id);
+
+-- Recreate indexes to ensure they exist for all tables.
+DROP INDEX IF EXISTS idx_indexed_files_summary_embedding;
+DROP INDEX IF EXISTS idx_code_chunks_embedding;
+DROP INDEX IF EXISTS idx_commits_embedding;
+CREATE INDEX idx_indexed_files_summary_embedding ON indexed_files USING HNSW (summary_embedding vector_l2_ops);
+CREATE INDEX idx_code_chunks_embedding ON code_chunks USING HNSW (embedding vector_l2_ops);
+CREATE INDEX idx_commits_embedding ON commits USING HNSW (embedding vector_l2_ops);
+
+-- B-tree indexes for faster joins.
+CREATE INDEX IF NOT EXISTS idx_indexed_files_project_id ON indexed_files (project_id);
+CREATE INDEX IF NOT EXISTS idx_code_chunks_file_id ON code_chunks (file_id);
+CREATE INDEX IF NOT EXISTS idx_commits_project_id ON commits (project_id);
+CREATE INDEX IF NOT EXISTS idx_commit_files_commit_id ON commit_files (commit_id);
+CREATE INDEX IF NOT EXISTS idx_commit_files_file_id ON commit_files (file_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks (project_id);
