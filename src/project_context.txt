@@ -165,7 +165,7 @@ program
     try {
       await client.connect();
       const projectId = await getProjectId(source, client);
-      await runIngestion(projectId, projectPath);
+      await runIngestion(projectId, projectPath, console.log);
       console.log('✅ Ingestion complete.');
     } catch (error) {
       console.error('❌ Ingestion failed:', error);
@@ -189,36 +189,65 @@ program
       const projectId = await getProjectId(options.project, client);
 
       const questionEmbedding = await getEmbedding(question);
+      let contextString = '';
 
+      // --- Retrieve relevant tasks ---
+      const { rows: relevantTasks } = await client.query(
+        `SELECT task_number, title, status FROM tasks WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
+        [projectId, pgvector.toSql(questionEmbedding)]
+      );
+
+      if (relevantTasks.length > 0) {
+        console.log(`\n🔍 Found relevant tasks: ${relevantTasks.map(t => `#${t.task_number}`).join(', ')}`);
+        contextString += "Relevant Tasks:\n" + relevantTasks.map(t => `- Task #${t.task_number} [${t.status.toUpperCase()}]: ${t.title}`).join('\n') + '\n\n';
+      }
+
+      // --- Retrieve relevant commits ---
+      const { rows: relevantCommits } = await client.query(
+        `SELECT commit_hash, message, author_name FROM commits WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
+        [projectId, pgvector.toSql(questionEmbedding)]
+      );
+      
+      if (relevantCommits.length > 0) {
+          console.log(`\n🔍 Found relevant commits: ${relevantCommits.map(c => c.commit_hash.substring(0, 7)).join(', ')}`);
+          contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
+      }
+
+      // --- Retrieve relevant files and code chunks ---
       const { rows: relevantFiles } = await client.query(
         `SELECT id, path, summary FROM indexed_files WHERE project_id = $1 ORDER BY summary_embedding <=> $2 LIMIT 5`,
         [projectId, pgvector.toSql(questionEmbedding)]
       );
       
-      if (relevantFiles.length === 0) {
-        console.log("I couldn't find any relevant files to answer that question.");
+      if (relevantFiles.length === 0 && relevantTasks.length === 0 && relevantCommits.length === 0) {
+        console.log("I couldn't find any relevant information to answer that question.");
         return;
       }
       
-      console.log(`\n🔍 Found relevant files: ${relevantFiles.map(f => f.path).join(', ')}`);
-      const relevantFileIds = relevantFiles.map(f => f.id);
+      if (relevantFiles.length > 0) {
+        console.log(`\n🔍 Found relevant files: ${relevantFiles.map(f => f.path).join(', ')}`);
+        const relevantFileIds = relevantFiles.map(f => f.id);
 
-      const { rows: contextChunks } = await client.query(
-        `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
-        [relevantFileIds, pgvector.toSql(questionEmbedding)]
-      );
+        const { rows: contextChunks } = await client.query(
+          `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
+          [relevantFileIds, pgvector.toSql(questionEmbedding)]
+        );
 
-      if (contextChunks.length === 0) {
-        console.log("I found some relevant files, but couldn't pinpoint specific code snippets to answer your question.");
+        if (contextChunks.length > 0) {
+          const chunkContext = contextChunks.map(c => {
+            const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
+            return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
+          }).join('\n\n');
+          contextString += "Relevant Code Snippets:\n" + chunkContext;
+        }
+      }
+
+      if (!contextString.trim()) {
+        console.log("I found some potentially relevant items but couldn't construct a concrete context to answer your question.");
         return;
       }
 
-      const contextString = contextChunks.map(c => {
-        const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
-        return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
-      }).join('\n\n');
-
-      const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided code context. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
+      const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
       const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
 
       const stream = await openai.chat.completions.create({
@@ -240,7 +269,7 @@ program
     }
   });
 
-// --- NEW: TASK MANAGEMENT COMMANDS ---
+// --- TASK MANAGEMENT COMMANDS ---
 const task = program.command('task').description('Manage project tasks');
 
 task
@@ -253,14 +282,18 @@ task
     try {
         await client.connect();
         const projectId = await getProjectId(options.project, client);
+        
+        const titleEmbedding = await getEmbedding(title);
+
         const result = await client.query(
-            'INSERT INTO tasks (project_id, title) VALUES ($1, $2) RETURNING task_number',
-            [projectId, title]
+            'INSERT INTO tasks (project_id, title, embedding) VALUES ($1, $2, $3) RETURNING task_number',
+            [projectId, title, pgvector.toSql(titleEmbedding)]
         );
         const taskNumber = result.rows[0].task_number;
         console.log(`✅ Created task #${taskNumber}: "${title}"`);
     } catch (error) {
         console.error('❌ Could not add task:', error);
+        console.error('NOTE: This might be due to a missing `embedding` column on the `tasks` table. Please run: ALTER TABLE tasks ADD COLUMN embedding vector(1536);');
     } finally {
         await client.end();
     }
@@ -441,6 +474,9 @@ const openai = new OpenAI({ apiKey: openaiApiKey });
 const IGNORED_EXTENSIONS = new Set(['.lock', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.ico']);
 const IGNORED_FILENAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
 
+// NEW: Define a logger type
+export type IngestionLogger = (message: string) => void;
+
 // --- CORE HELPER FUNCTIONS ---
 async function getEmbedding(text: string): Promise<number[]> {
   const response = await openai.embeddings.create({
@@ -450,7 +486,7 @@ async function getEmbedding(text: string): Promise<number[]> {
   return response.data[0].embedding;
 }
 
-async function summarizeFile(filePath: string, content: string): Promise<string> {
+async function summarizeFile(filePath: string, content: string, logger: IngestionLogger): Promise<string> {
   const prompt = `Summarize the purpose of the following code file in one sentence. File Path: ${filePath}\n\nCode:\n---\n${content}\n---\n\nOne-sentence summary:`;
   try {
     const response = await openai.chat.completions.create({
@@ -461,34 +497,34 @@ async function summarizeFile(filePath: string, content: string): Promise<string>
     });
     return response.choices[0].message.content?.trim() || "Could not generate a summary.";
   } catch (error) {
-    console.error(`  - Failed to summarize ${filePath}:`, error);
+    logger(`  - Failed to summarize ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
     return "Summary generation failed.";
   }
 }
 
 // --- MAIN INGESTION LOGIC ---
-export async function runIngestion(projectId: number, projectPath: string) {
+export async function runIngestion(projectId: number, projectPath: string, logger: IngestionLogger) {
   const client = new Client({ connectionString });
   await client.connect();
   await pgvector.registerType(client);
-  console.log('Database connection established.');
+  logger('Database connection established.');
 
   const git: SimpleGit = simpleGit(projectPath);
 
   try {
-    await syncFiles(client, projectId, projectPath);
-    await syncGitHistory(client, projectId, git);
+    await syncFiles(client, projectId, projectPath, logger);
+    await syncGitHistory(client, projectId, git, logger);
   } finally {
-    console.log('Ingestion process finished. Closing database connection.');
+    logger('Ingestion process finished. Closing database connection.');
     await client.end();
   }
 }
 
 // --- STAGE 1: Sync Filesystem State ---
-async function syncFiles(client: Client, projectId: number, projectPath: string) {
-  console.log(`[1/4] Starting file sync for project ID: ${projectId}`);
+async function syncFiles(client: Client, projectId: number, projectPath: string, logger: IngestionLogger) {
+  logger(`[1/4] Starting file sync for project ID: ${projectId}`);
   
-  console.log(`[2/4] Pruning deleted files from the database...`);
+  logger(`[2/4] Pruning deleted files from the database...`);
   const { rows: dbFiles } = await client.query('SELECT path FROM indexed_files WHERE project_id = $1', [projectId]);
   const dbPaths = new Set(dbFiles.map(f => f.path));
   
@@ -498,11 +534,11 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
   const pathsToDelete = [...dbPaths].filter(p => !diskPaths.has(p));
 
   if (pathsToDelete.length > 0) {
-    console.log(`      Found ${pathsToDelete.length} files to delete.`);
+    logger(`      Found ${pathsToDelete.length} files to delete.`);
     await client.query('DELETE FROM indexed_files WHERE project_id = $1 AND path = ANY($2::text[])', [projectId, pathsToDelete]);
-    console.log(`      -> Pruning complete.`);
+    logger(`      -> Pruning complete.`);
   } else {
-    console.log(`      -> No files to prune.`);
+    logger(`      -> No files to prune.`);
   }
 
   const gitignorePath = path.join(projectPath, '.gitignore');
@@ -516,7 +552,7 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
     return ignore.accepts(file) && !IGNORED_EXTENSIONS.has(ext) && !IGNORED_FILENAMES.has(filename);
   });
 
-  console.log(`[3/4] Found ${filesToIndex.length} files to process for additions/modifications.`);
+  logger(`[3/4] Found ${filesToIndex.length} files to process for additions/modifications.`);
   let processedCount = 0;
 
   for (const relativePath of filesToIndex) {
@@ -524,7 +560,7 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
     const content = fs.readFileSync(fullPath, 'utf-8');
     if (!content.trim()) continue;
 
-    const hash = crypto.createHash('sha265').update(content).digest('hex');
+    const hash = crypto.createHash('sha256').update(content).digest('hex'); // Corrected from sha265
     const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
 
     if (rows.length > 0 && rows[0].content_hash === hash) {
@@ -532,13 +568,13 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
     }
 
     processedCount++;
-    console.log(`      Processing changed file: ${relativePath}`);
+    logger(`      Processing changed file: ${relativePath}`);
 
     await client.query('BEGIN');
     try {
       await client.query('DELETE FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
       
-      const summary = await summarizeFile(relativePath, content);
+      const summary = await summarizeFile(relativePath, content, logger);
       const summaryEmbedding = await getEmbedding(summary);
       
       const fileInsertResult = await client.query(
@@ -558,32 +594,32 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
-      console.error(`      Failed to process ${relativePath}:`, error);
+      logger(`      Failed to process ${relativePath}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  console.log(`[4/4] File sync complete. Processed ${processedCount} new or changed files.`);
+  logger(`[4/4] File sync complete. Processed ${processedCount} new or changed files.`);
 }
 
 // --- STAGE 2: Sync Git Commit History ---
-async function syncGitHistory(client: Client, projectId: number, git: SimpleGit) {
-    console.log('\n[1/3] Starting Git history sync...');
+async function syncGitHistory(client: Client, projectId: number, git: SimpleGit, logger: IngestionLogger) {
+    logger('\n[1/3] Starting Git history sync...');
     
     const { rows: existingCommits } = await client.query('SELECT commit_hash FROM commits WHERE project_id = $1', [projectId]);
     const existingHashes = new Set(existingCommits.map(c => c.commit_hash));
-    console.log(`[2/3] Found ${existingHashes.size} existing commits in the database.`);
+    logger(`[2/3] Found ${existingHashes.size} existing commits in the database.`);
 
     const log = await git.log();
     const allCommits = [...log.all].reverse();
 
     const newCommits = allCommits.filter(c => !existingHashes.has(c.hash));
     if (newCommits.length === 0) {
-        console.log('[3/3] Git history is already up-to-date.');
+        logger('[3/3] Git history is already up-to-date.');
         return;
     }
-    console.log(`      Found ${newCommits.length} new commits to process.`);
+    logger(`      Found ${newCommits.length} new commits to process.`);
 
     for (const commit of newCommits) {
-        console.log(`      Processing commit ${commit.hash.substring(0, 7)}: ${commit.message}`);
+        logger(`      Processing commit ${commit.hash.substring(0, 7)}: ${commit.message}`);
         
         await client.query('BEGIN');
         try {
@@ -619,23 +655,23 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit)
             let match;
             while ((match = taskRegex.exec(commit.message)) !== null) {
                 const taskNumber = parseInt(match[1], 10);
-                console.log(`      -> Found reference to close task #${taskNumber}.`);
+                logger(`      -> Found reference to close task #${taskNumber}.`);
                 const updateResult = await client.query(
                     `UPDATE tasks SET status = 'done', updated_at = NOW() WHERE project_id = $1 AND task_number = $2 AND status != 'done'`,
                     [projectId, taskNumber]
                 );
                 if (updateResult.rowCount && updateResult.rowCount > 0) {
-                    console.log(`      ✅ Automatically closed task #${taskNumber}.`);
+                    logger(`      ✅ Automatically closed task #${taskNumber}.`);
                 }
             }
 
             await client.query('COMMIT');
         } catch (error) {
             await client.query('ROLLBACK');
-            console.error(`      Failed to process commit ${commit.hash}:`, error);
+            logger(`      Failed to process commit ${commit.hash}: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
-    console.log('[3/3] Git history sync complete.');
+    logger('[3/3] Git history sync complete.');
 }
 
 --- FILE: api/tasks/task.controller.ts ---
@@ -705,6 +741,8 @@ export default router;
 
 // src/api/tasks/task.service.ts
 import { getDbClient } from '../../services/db';
+import { getEmbedding } from '../../services/openai';
+import pgvector from 'pgvector/pg';
 
 export async function getTasks(projectId: number, status?: string) {
     const client = await getDbClient();
@@ -724,21 +762,24 @@ export async function getTasks(projectId: number, status?: string) {
     }
 }
 
-// ADD THIS FUNCTION
 export async function createTask(projectId: number, title: string) {
     const client = await getDbClient();
     try {
+        const titleEmbedding = await getEmbedding(title);
         const { rows } = await client.query(
-            'INSERT INTO tasks (project_id, title) VALUES ($1, $2) RETURNING *',
-            [projectId, title]
+            'INSERT INTO tasks (project_id, title, embedding) VALUES ($1, $2, $3) RETURNING *',
+            [projectId, title, pgvector.toSql(titleEmbedding)]
         );
         return rows[0];
-    } finally {
+    } catch (error) {
+        console.error('Task creation failed. Ensure the `tasks` table has an `embedding` column.');
+        throw error;
+    }
+    finally {
         await client.end();
     }
 }
 
-// ADD THIS FUNCTION
 export async function updateTask(projectId: number, taskNumber: number, status: string) {
     const client = await getDbClient();
     try {
@@ -767,7 +808,7 @@ export async function updateTask(projectId: number, taskNumber: number, status: 
 // src/api/projects/project.controller.ts
 import { Request, Response, NextFunction } from 'express';
 import * as projectService from './project.service';
-import * as qaService from './qa.service'; // We will create this next
+import * as qaService from './qa.service';
 
 export async function listProjects(req: Request, res: Response, next: NextFunction) {
     try {
@@ -792,25 +833,61 @@ export async function addProject(req: Request, res: Response, next: NextFunction
         }
         
         // Respond immediately and start ingestion in the background
-        res.status(202).json({ message: 'Project created. Ingestion started.', project });
-        projectService.startProjectIngestion(project.id, project.source);
+        res.status(202).json({ message: 'Project created. Ingestion will start in the background.', project });
+        projectService.startProjectIngestionInBackground(project.id, project.source);
 
     } catch (error) {
         next(error);
     }
 }
 
-export async function syncProject(req: Request, res: Response, next: NextFunction) {
+// REMOVED old syncProject, which is replaced by streamIngestionLogs
+
+// NEW: Controller for streaming ingestion logs
+export async function streamIngestionLogs(req: Request, res: Response, next: NextFunction) {
+    const projectId = parseInt(req.params.projectId, 10);
+    
+    // Set headers for SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders(); // Flush the headers to establish the connection
+
+    const logger = (message: string) => {
+        // Format message for SSE
+        res.write(`data: ${JSON.stringify({ log: message })}\n\n`);
+    };
+
+    // Handle client disconnect
+    req.on('close', () => {
+        console.log(`Client disconnected from ingestion stream for project ${projectId}.`);
+        res.end();
+    });
+
     try {
-        const projectId = parseInt(req.params.projectId, 10);
-        const { source } = req.body; // Assuming source is passed to find repo
+        const project = await projectService.getProjectById(projectId);
+        if (!project) {
+            logger(`Error: Project with ID ${projectId} not found.`);
+            res.end();
+            return;
+        }
         
-        res.status(202).json({ message: 'Project sync started.' });
-        projectService.startProjectIngestion(projectId, source);
+        // Start the ingestion and wait for it to complete, streaming logs along the way
+        await projectService.startProjectIngestion(projectId, project.source, logger);
+        
+        // Signal the end of the stream
+        res.write('event: end\ndata: {"message": "Ingestion complete"}\n\n');
+        res.end();
+
     } catch (error) {
-        next(error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger(`FATAL ERROR: ${errorMessage}`);
+        console.error("Error during ingestion stream:", error);
+        res.write(`event: error\ndata: {"message": "${errorMessage}"}\n\n`);
+        res.end();
     }
 }
+
 
 export async function askQuestion(req: Request, res: Response, next: NextFunction) {
     try {
@@ -849,7 +926,10 @@ const router = Router();
 
 router.get('/', projectController.listProjects);
 router.post('/', projectController.addProject);
-router.post('/:projectId/sync', projectController.syncProject);
+
+// MODIFIED: This is now a GET request to establish an SSE connection for logs
+router.get('/:projectId/sync-stream', projectController.streamIngestionLogs);
+
 router.post('/:projectId/ask', projectController.askQuestion);
 
 // Mount task routes nested under projects
@@ -862,7 +942,7 @@ export default router;
 // src/api/projects/project.service.ts
 import { getDbClient } from '../../services/db';
 import { cloneOrPullRepo } from '../../services/git';
-import { runIngestion } from '../../scripts/ingest';
+import { runIngestion, IngestionLogger } from '../../scripts/ingest'; // Import IngestionLogger
 import path from 'path';
 
 export async function getAllProjects() {
@@ -875,10 +955,24 @@ export async function getAllProjects() {
     }
 }
 
+export async function getProjectById(projectId: number) {
+    const client = await getDbClient();
+    try {
+        const { rows } = await client.query('SELECT * FROM projects WHERE id = $1', [projectId]);
+        if (rows.length === 0) {
+            return null;
+        }
+        return rows[0];
+    } finally {
+        await client.end();
+    }
+}
+
+
 export async function createProject(source: string) {
     const client = await getDbClient();
     try {
-        const existing = await client.query('SELECT id FROM projects WHERE source = $1', [source]);
+        const existing = await client.query('SELECT * FROM projects WHERE source = $1', [source]);
         if (existing.rows.length > 0) {
             // Project already exists, return it
             return { project: existing.rows[0], created: false };
@@ -895,15 +989,25 @@ export async function createProject(source: string) {
     }
 }
 
-export async function startProjectIngestion(projectId: number, source: string) {
+// MODIFIED: This function now accepts a logger and is the core logic for ingestion.
+export async function startProjectIngestion(projectId: number, source: string, logger: IngestionLogger) {
     try {
-        const projectPath = await cloneOrPullRepo(source);
-        console.log(`[Project ${projectId}] Ingestion running...`);
-        await runIngestion(projectId, projectPath);
-        console.log(`✅ [Project ${projectId}] Ingestion complete.`);
+        const projectPath = await cloneOrPullRepo(source, logger); // Pass logger to git service
+        logger(`[Project ${projectId}] Ingestion running...`);
+        await runIngestion(projectId, projectPath, logger);
+        logger(`✅ [Project ${projectId}] Ingestion complete.`);
     } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger(`❌ [Project ${projectId}] Ingestion failed: ${errorMessage}`);
         console.error(`❌ [Project ${projectId}] Ingestion failed:`, error);
     }
+}
+
+// NEW HELPER for fire-and-forget ingestion
+export function startProjectIngestionInBackground(projectId: number, source: string) {
+    // We don't await this, so it runs in the background.
+    // Logs will go to the console.
+    startProjectIngestion(projectId, source, console.log);
 }
 
 --- FILE: api/projects/qa.service.ts ---
@@ -917,32 +1021,55 @@ export async function getAnswerStream(projectId: number, question: string) {
     const client = await getDbClient();
     try {
         const questionEmbedding = await openAI.getEmbedding(question);
+        let contextString = '';
 
+        // --- Retrieve relevant tasks ---
+        const { rows: relevantTasks } = await client.query(
+            `SELECT task_number, title, status FROM tasks WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
+            [projectId, pgvector.toSql(questionEmbedding)]
+        );
+        if (relevantTasks.length > 0) {
+            contextString += "Relevant Tasks:\n" + relevantTasks.map(t => `- Task #${t.task_number} [${t.status.toUpperCase()}]: ${t.title}`).join('\n') + '\n\n';
+        }
+
+        // --- Retrieve relevant commits ---
+        const { rows: relevantCommits } = await client.query(
+            `SELECT commit_hash, message, author_name FROM commits WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
+            [projectId, pgvector.toSql(questionEmbedding)]
+        );
+        if (relevantCommits.length > 0) {
+            contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
+        }
+
+
+        // --- Retrieve relevant files and code chunks ---
         const { rows: relevantFiles } = await client.query(
             `SELECT id, path FROM indexed_files WHERE project_id = $1 ORDER BY summary_embedding <=> $2 LIMIT 5`,
             [projectId, pgvector.toSql(questionEmbedding)]
         );
         
-        if (relevantFiles.length === 0) {
-            throw new Error("No relevant files found for this question.");
+        if (relevantFiles.length > 0) {
+            const relevantFileIds = relevantFiles.map(f => f.id);
+            const { rows: contextChunks } = await client.query(
+                `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
+                [relevantFileIds, pgvector.toSql(questionEmbedding)]
+            );
+            
+            if (contextChunks.length > 0) {
+                 const chunkContext = contextChunks.map(c => {
+                    const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
+                    return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
+                }).join('\n\n');
+                contextString += "Relevant Code Snippets:\n" + chunkContext;
+            }
+        }
+        
+        if (!contextString.trim()) {
+            throw new Error("No relevant context found for this question (no tasks, commits, or code).");
         }
 
-        const relevantFileIds = relevantFiles.map(f => f.id);
-        const { rows: contextChunks } = await client.query(
-            `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
-            [relevantFileIds, pgvector.toSql(questionEmbedding)]
-        );
 
-        if (contextChunks.length === 0) {
-            throw new Error("No relevant code chunks found for this question.");
-        }
-
-        const contextString = contextChunks.map(c => {
-            const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
-            return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
-        }).join('\n\n');
-
-        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided code context. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
+        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
         const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
         
         return openAI.getChatCompletionStream(systemPrompt, userPrompt);
@@ -976,6 +1103,9 @@ import path from 'path';
 import os from 'os';
 
 const WORKSPACE_DIR = path.join(os.homedir(), '.ai-brain-workspace');
+// Optional: Define a logger type for clarity
+type GitLogger = (message: string) => void;
+
 
 export function getWorkspacePathFromUrl(url: string): string {
     try {
@@ -993,17 +1123,19 @@ export function getWorkspacePathFromUrl(url: string): string {
     }
 }
 
-export async function cloneOrPullRepo(source: string): Promise<string> {
+export async function cloneOrPullRepo(source: string, logger: GitLogger = console.log): Promise<string> {
     const projectPath = getWorkspacePathFromUrl(source);
     await fs.mkdir(WORKSPACE_DIR, { recursive: true });
 
     try {
         await fs.access(path.join(projectPath, '.git'));
-        console.log(`Found existing repository. Fetching updates from ${source}...`);
+        logger(`Found existing repository. Fetching updates from ${source}...`);
         await simpleGit(projectPath).pull();
+        logger(`-> Updates pulled successfully.`);
     } catch (error) {
-        console.log(`Cloning repository from ${source}...`);
+        logger(`Cloning repository from ${source}...`);
         await simpleGit().clone(source, projectPath);
+        logger(`-> Cloned successfully.`);
     }
     return projectPath;
 }

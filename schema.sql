@@ -68,6 +68,7 @@ CREATE TABLE tasks (
     UNIQUE (project_id, task_number)
 );
 
+ALTER TABLE tasks ADD COLUMN embedding vector(1536);
 
 -- Recreate indexes to ensure they exist for all tables.
 DROP INDEX IF EXISTS idx_indexed_files_summary_embedding;

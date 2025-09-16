@@ -7,32 +7,55 @@ export async function getAnswerStream(projectId: number, question: string) {
     const client = await getDbClient();
     try {
         const questionEmbedding = await openAI.getEmbedding(question);
+        let contextString = '';
 
+        // --- Retrieve relevant tasks ---
+        const { rows: relevantTasks } = await client.query(
+            `SELECT task_number, title, status FROM tasks WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
+            [projectId, pgvector.toSql(questionEmbedding)]
+        );
+        if (relevantTasks.length > 0) {
+            contextString += "Relevant Tasks:\n" + relevantTasks.map(t => `- Task #${t.task_number} [${t.status.toUpperCase()}]: ${t.title}`).join('\n') + '\n\n';
+        }
+
+        // --- Retrieve relevant commits ---
+        const { rows: relevantCommits } = await client.query(
+            `SELECT commit_hash, message, author_name FROM commits WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
+            [projectId, pgvector.toSql(questionEmbedding)]
+        );
+        if (relevantCommits.length > 0) {
+            contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
+        }
+
+
+        // --- Retrieve relevant files and code chunks ---
         const { rows: relevantFiles } = await client.query(
             `SELECT id, path FROM indexed_files WHERE project_id = $1 ORDER BY summary_embedding <=> $2 LIMIT 5`,
             [projectId, pgvector.toSql(questionEmbedding)]
         );
         
-        if (relevantFiles.length === 0) {
-            throw new Error("No relevant files found for this question.");
+        if (relevantFiles.length > 0) {
+            const relevantFileIds = relevantFiles.map(f => f.id);
+            const { rows: contextChunks } = await client.query(
+                `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
+                [relevantFileIds, pgvector.toSql(questionEmbedding)]
+            );
+            
+            if (contextChunks.length > 0) {
+                 const chunkContext = contextChunks.map(c => {
+                    const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
+                    return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
+                }).join('\n\n');
+                contextString += "Relevant Code Snippets:\n" + chunkContext;
+            }
+        }
+        
+        if (!contextString.trim()) {
+            throw new Error("No relevant context found for this question (no tasks, commits, or code).");
         }
 
-        const relevantFileIds = relevantFiles.map(f => f.id);
-        const { rows: contextChunks } = await client.query(
-            `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
-            [relevantFileIds, pgvector.toSql(questionEmbedding)]
-        );
 
-        if (contextChunks.length === 0) {
-            throw new Error("No relevant code chunks found for this question.");
-        }
-
-        const contextString = contextChunks.map(c => {
-            const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
-            return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
-        }).join('\n\n');
-
-        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided code context. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
+        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
         const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
         
         return openAI.getChatCompletionStream(systemPrompt, userPrompt);

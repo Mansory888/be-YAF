@@ -104,7 +104,7 @@ program
     try {
       await client.connect();
       const projectId = await getProjectId(source, client);
-      await runIngestion(projectId, projectPath);
+      await runIngestion(projectId, projectPath, console.log);
       console.log('✅ Ingestion complete.');
     } catch (error) {
       console.error('❌ Ingestion failed:', error);
@@ -128,36 +128,65 @@ program
       const projectId = await getProjectId(options.project, client);
 
       const questionEmbedding = await getEmbedding(question);
+      let contextString = '';
 
+      // --- Retrieve relevant tasks ---
+      const { rows: relevantTasks } = await client.query(
+        `SELECT task_number, title, status FROM tasks WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
+        [projectId, pgvector.toSql(questionEmbedding)]
+      );
+
+      if (relevantTasks.length > 0) {
+        console.log(`\n🔍 Found relevant tasks: ${relevantTasks.map(t => `#${t.task_number}`).join(', ')}`);
+        contextString += "Relevant Tasks:\n" + relevantTasks.map(t => `- Task #${t.task_number} [${t.status.toUpperCase()}]: ${t.title}`).join('\n') + '\n\n';
+      }
+
+      // --- Retrieve relevant commits ---
+      const { rows: relevantCommits } = await client.query(
+        `SELECT commit_hash, message, author_name FROM commits WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
+        [projectId, pgvector.toSql(questionEmbedding)]
+      );
+      
+      if (relevantCommits.length > 0) {
+          console.log(`\n🔍 Found relevant commits: ${relevantCommits.map(c => c.commit_hash.substring(0, 7)).join(', ')}`);
+          contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
+      }
+
+      // --- Retrieve relevant files and code chunks ---
       const { rows: relevantFiles } = await client.query(
         `SELECT id, path, summary FROM indexed_files WHERE project_id = $1 ORDER BY summary_embedding <=> $2 LIMIT 5`,
         [projectId, pgvector.toSql(questionEmbedding)]
       );
       
-      if (relevantFiles.length === 0) {
-        console.log("I couldn't find any relevant files to answer that question.");
+      if (relevantFiles.length === 0 && relevantTasks.length === 0 && relevantCommits.length === 0) {
+        console.log("I couldn't find any relevant information to answer that question.");
         return;
       }
       
-      console.log(`\n🔍 Found relevant files: ${relevantFiles.map(f => f.path).join(', ')}`);
-      const relevantFileIds = relevantFiles.map(f => f.id);
+      if (relevantFiles.length > 0) {
+        console.log(`\n🔍 Found relevant files: ${relevantFiles.map(f => f.path).join(', ')}`);
+        const relevantFileIds = relevantFiles.map(f => f.id);
 
-      const { rows: contextChunks } = await client.query(
-        `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
-        [relevantFileIds, pgvector.toSql(questionEmbedding)]
-      );
+        const { rows: contextChunks } = await client.query(
+          `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
+          [relevantFileIds, pgvector.toSql(questionEmbedding)]
+        );
 
-      if (contextChunks.length === 0) {
-        console.log("I found some relevant files, but couldn't pinpoint specific code snippets to answer your question.");
+        if (contextChunks.length > 0) {
+          const chunkContext = contextChunks.map(c => {
+            const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
+            return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
+          }).join('\n\n');
+          contextString += "Relevant Code Snippets:\n" + chunkContext;
+        }
+      }
+
+      if (!contextString.trim()) {
+        console.log("I found some potentially relevant items but couldn't construct a concrete context to answer your question.");
         return;
       }
 
-      const contextString = contextChunks.map(c => {
-        const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
-        return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
-      }).join('\n\n');
-
-      const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided code context. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
+      const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
       const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
 
       const stream = await openai.chat.completions.create({
@@ -179,7 +208,7 @@ program
     }
   });
 
-// --- NEW: TASK MANAGEMENT COMMANDS ---
+// --- TASK MANAGEMENT COMMANDS ---
 const task = program.command('task').description('Manage project tasks');
 
 task
@@ -192,14 +221,18 @@ task
     try {
         await client.connect();
         const projectId = await getProjectId(options.project, client);
+        
+        const titleEmbedding = await getEmbedding(title);
+
         const result = await client.query(
-            'INSERT INTO tasks (project_id, title) VALUES ($1, $2) RETURNING task_number',
-            [projectId, title]
+            'INSERT INTO tasks (project_id, title, embedding) VALUES ($1, $2, $3) RETURNING task_number',
+            [projectId, title, pgvector.toSql(titleEmbedding)]
         );
         const taskNumber = result.rows[0].task_number;
         console.log(`✅ Created task #${taskNumber}: "${title}"`);
     } catch (error) {
         console.error('❌ Could not add task:', error);
+        console.error('NOTE: This might be due to a missing `embedding` column on the `tasks` table. Please run: ALTER TABLE tasks ADD COLUMN embedding vector(1536);');
     } finally {
         await client.end();
     }
