@@ -3,6 +3,10 @@ import { getDbClient } from '../../services/db';
 import { cloneOrPullRepo } from '../../services/git';
 import { runIngestion, IngestionLogger } from '../../scripts/ingest'; // Import IngestionLogger
 import path from 'path';
+import { chunkText } from '../../core/textChunker';
+import { getEmbedding } from '../../services/openai';
+import fs from 'fs/promises';
+import pgvector from 'pgvector/pg';
 
 export async function getAllProjects() {
     const client = await getDbClient();
@@ -67,4 +71,42 @@ export function startProjectIngestionInBackground(projectId: number, source: str
     // We don't await this, so it runs in the background.
     // Logs will go to the console.
     startProjectIngestion(projectId, source, console.log);
+}
+
+export async function addProjectDocument(projectId: number, originalFilename: string, storedFilePath: string) {
+    const client = await getDbClient();
+    await client.query('BEGIN');
+    try {
+        // 1. Read the content of the uploaded file
+        const content = await fs.readFile(storedFilePath, 'utf-8');
+
+        // 2. Insert document metadata
+        const docResult = await client.query(
+            'INSERT INTO project_documents (project_id, file_name, file_path) VALUES ($1, $2, $3) RETURNING id',
+            [projectId, originalFilename, storedFilePath]
+        );
+        const documentId = docResult.rows[0].id;
+
+        // 3. Chunk the text content
+        const chunks = chunkText(content);
+
+        // 4. Embed and insert each chunk
+        for (const chunk of chunks) {
+            const embedding = await getEmbedding(chunk);
+            await client.query(
+                'INSERT INTO document_chunks (document_id, content, embedding) VALUES ($1, $2, $3)',
+                [documentId, chunk, pgvector.toSql(embedding)]
+            );
+        }
+
+        await client.query('COMMIT');
+        return { id: documentId, file_name: originalFilename };
+    } catch (error) {
+        await client.query('ROLLBACK');
+        // Clean up the uploaded file on error
+        await fs.unlink(storedFilePath).catch(e => console.error("Failed to clean up file:", e));
+        throw error;
+    } finally {
+        await client.end();
+    }
 }

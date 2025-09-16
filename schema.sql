@@ -85,3 +85,30 @@ CREATE INDEX IF NOT EXISTS idx_commits_project_id ON commits (project_id);
 CREATE INDEX IF NOT EXISTS idx_commit_files_commit_id ON commit_files (commit_id);
 CREATE INDEX IF NOT EXISTS idx_commit_files_file_id ON commit_files (file_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks (project_id);
+
+ALTER TABLE tasks ADD COLUMN category TEXT;
+
+
+-- Create a table to store metadata about uploaded project documents.
+CREATE TABLE project_documents (
+  id SERIAL PRIMARY KEY,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  file_name TEXT NOT NULL,
+  file_path TEXT NOT NULL, -- Path on the server's file system
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  UNIQUE (project_id, file_name)
+);
+
+-- Create a table to store the embedded chunks of these documents.
+CREATE TABLE document_chunks (
+  id SERIAL PRIMARY KEY,
+  document_id INTEGER NOT NULL REFERENCES project_documents(id) ON DELETE CASCADE,
+  content TEXT NOT NULL,
+  embedding VECTOR(1536) NOT NULL
+);
+
+-- Create an index for fast vector searching on document chunks.
+CREATE INDEX idx_document_chunks_embedding ON document_chunks USING HNSW (embedding vector_l2_ops);
+
+-- B-tree index for faster joins.
+CREATE INDEX IF NOT EXISTS idx_project_documents_project_id ON project_documents (project_id);

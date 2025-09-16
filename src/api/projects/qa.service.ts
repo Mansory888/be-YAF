@@ -27,6 +27,21 @@ export async function getAnswerStream(projectId: number, question: string) {
             contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
         }
 
+        // --- NEW: Retrieve relevant project documents ---
+        const { rows: relevantDocChunks } = await client.query(
+            `SELECT
+               pd.file_name,
+               dc.content
+             FROM document_chunks dc
+             JOIN project_documents pd ON dc.document_id = pd.id
+             WHERE pd.project_id = $1
+             ORDER BY dc.embedding <=> $2
+             LIMIT 3`,
+            [projectId, pgvector.toSql(questionEmbedding)]
+        );
+        if (relevantDocChunks.length > 0) {
+            contextString += "Relevant Project Documents:\n" + relevantDocChunks.map(d => `--- FROM DOCUMENT: ${d.file_name} ---\n\n${d.content}`).join('\n\n') + '\n\n';
+        }
 
         // --- Retrieve relevant files and code chunks ---
         const { rows: relevantFiles } = await client.query(
@@ -51,11 +66,10 @@ export async function getAnswerStream(projectId: number, question: string) {
         }
         
         if (!contextString.trim()) {
-            throw new Error("No relevant context found for this question (no tasks, commits, or code).");
+            throw new Error("No relevant context found for this question (no tasks, commits, documents, or code).");
         }
 
-
-        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
+        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include project documents, tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
         const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
         
         return openAI.getChatCompletionStream(systemPrompt, userPrompt);

@@ -2,6 +2,8 @@
 import { Request, Response, NextFunction } from 'express';
 import * as projectService from './project.service';
 import * as qaService from './qa.service';
+import ingestionQueue from '../../services/queue.service';
+
 
 export async function listProjects(req: Request, res: Response, next: NextFunction) {
     try {
@@ -40,45 +42,54 @@ export async function addProject(req: Request, res: Response, next: NextFunction
 export async function streamIngestionLogs(req: Request, res: Response, next: NextFunction) {
     const projectId = parseInt(req.params.projectId, 10);
     
-    // Set headers for SSE
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders(); // Flush the headers to establish the connection
+    res.flushHeaders();
 
     const logger = (message: string) => {
-        // Format message for SSE
-        res.write(`data: ${JSON.stringify({ log: message })}\n\n`);
+        if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify({ log: message })}\n\n`);
+        }
     };
 
-    // Handle client disconnect
     req.on('close', () => {
         console.log(`Client disconnected from ingestion stream for project ${projectId}.`);
         res.end();
     });
 
-    try {
-        const project = await projectService.getProjectById(projectId);
-        if (!project) {
-            logger(`Error: Project with ID ${projectId} not found.`);
-            res.end();
-            return;
-        }
-        
-        // Start the ingestion and wait for it to complete, streaming logs along the way
-        await projectService.startProjectIngestion(projectId, project.source, logger);
-        
-        // Signal the end of the stream
-        res.write('event: end\ndata: {"message": "Ingestion complete"}\n\n');
-        res.end();
+    // MODIFIED: Wrap the entire ingestion logic in the queue
+    ingestionQueue.add(async () => {
+        try {
+            const project = await projectService.getProjectById(projectId);
+            if (!project) {
+                logger(`Error: Project with ID ${projectId} not found.`);
+                return; // Return from the job, not the outer function
+            }
+            
+            logger('Your sync request is now being processed...');
+            await projectService.startProjectIngestion(projectId, project.source, logger);
+            
+            logger('Ingestion complete.');
+            res.write('event: end\ndata: {"message": "Ingestion complete"}\n\n');
 
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logger(`FATAL ERROR: ${errorMessage}`);
-        console.error("Error during ingestion stream:", error);
-        res.write(`event: error\ndata: {"message": "${errorMessage}"}\n\n`);
-        res.end();
-    }
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            logger(`FATAL ERROR: ${errorMessage}`);
+            console.error("Error during ingestion stream:", error);
+            res.write(`event: error\ndata: {"message": "${errorMessage}"}\n\n`);
+        } finally {
+            if (!res.writableEnded) {
+                res.end();
+            }
+        }
+    }).catch((err:any) => {
+        // This catch is for errors adding the job to the queue itself, which is rare.
+        console.error("Failed to add ingestion job to queue:", err);
+        if (!res.writableEnded) {
+            res.status(500).send("Failed to queue the ingestion job.");
+        }
+    });
 }
 
 
@@ -105,5 +116,24 @@ export async function askQuestion(req: Request, res: Response, next: NextFunctio
           console.error("Error during streaming:", error);
           res.end();
         }
+    }
+}
+
+export async function uploadDocument(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded.' });
+        }
+        
+        const document = await projectService.addProjectDocument(
+            projectId,
+            req.file.originalname,
+            req.file.path
+        );
+
+        res.status(201).json({ message: 'Document uploaded and indexed successfully.', document });
+    } catch (error) {
+        next(error);
     }
 }

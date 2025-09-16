@@ -2,8 +2,10 @@
 import { Router } from 'express';
 import * as projectController from './project.controller';
 import taskRoutes from '../tasks/task.routes';
+import multer from 'multer';
 
 const router = Router();
+const upload = multer({ dest: 'uploads/' });
 
 router.get('/', projectController.listProjects);
 router.post('/', projectController.addProject);
@@ -12,6 +14,7 @@ router.post('/', projectController.addProject);
 router.get('/:projectId/sync-stream', projectController.streamIngestionLogs);
 
 router.post('/:projectId/ask', projectController.askQuestion);
+router.post('/:projectId/documents', upload.single('document'), projectController.uploadDocument);
 
 // Mount task routes nested under projects
 router.use('/:projectId/tasks', taskRoutes);

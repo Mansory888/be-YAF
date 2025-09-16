@@ -172,7 +172,7 @@ async function generateTaskFromCommit(client: Client, projectId: number, commit:
             model: 'gpt-4o',
             messages: [{ role: 'user', content: prompt }],
             response_format: { type: 'json_object' },
-            max_tokens: 150,
+            max_tokens: 400, // Increased token limit for more detailed descriptions
             temperature: 0.1,
         });
         
@@ -183,15 +183,17 @@ async function generateTaskFromCommit(client: Client, projectId: number, commit:
             return;
         }
 
-        const { title, category } = JSON.parse(responseText);
+        // MODIFIED: Destructure the new 'description' field
+        const { title, category, description } = JSON.parse(responseText);
 
-        if (!title || !category) {
-            throw new Error('AI response was missing title or category.');
+        if (!title || !category || !description) {
+            throw new Error('AI response was missing title, category, or description.');
         }
 
         logger(`      -> AI generated task: [${category}] "${title}"`);
 
-        const contentToEmbed = `[${category}] ${title}\n\nCompleted in commit: ${commit.hash}`;
+        // MODIFIED: The content to embed now includes the more detailed description
+        const contentToEmbed = `[${category}] ${title}\n\n${description}\n\nCompleted in commit: ${commit.hash}`;
         const taskEmbedding = await getEmbedding(contentToEmbed);
 
         await client.query(
@@ -200,7 +202,8 @@ async function generateTaskFromCommit(client: Client, projectId: number, commit:
             [
                 projectId, 
                 title, 
-                `Automatically generated from commit ${commit.hash.substring(0, 7)} by ${commit.author_name}.`,
+                // MODIFIED: Use the AI-generated description
+                description,
                 category,
                 pgvector.toSql(taskEmbedding),
                 commit.date
