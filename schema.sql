@@ -86,6 +86,8 @@ CREATE INDEX IF NOT EXISTS idx_commit_files_commit_id ON commit_files (commit_id
 CREATE INDEX IF NOT EXISTS idx_commit_files_file_id ON commit_files (file_id);
 CREATE INDEX IF NOT EXISTS idx_tasks_project_id ON tasks (project_id);
 
+ALTER TABLE tasks ADD COLUMN embedding vector(1536);
+
 ALTER TABLE tasks ADD COLUMN category TEXT;
 
 

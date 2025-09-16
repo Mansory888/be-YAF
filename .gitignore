@@ -4,3 +4,5 @@ dist/
 
 # Environment variables
 .env
+
+/uploads

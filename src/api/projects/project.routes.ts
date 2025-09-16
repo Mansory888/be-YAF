@@ -13,6 +13,9 @@ router.post('/', projectController.addProject);
 // MODIFIED: This is now a GET request to establish an SSE connection for logs
 router.get('/:projectId/sync-stream', projectController.streamIngestionLogs);
 
+// NEW: Route to get project statistics
+router.get('/:projectId/stats', projectController.getProjectStats);
+
 router.post('/:projectId/ask', projectController.askQuestion);
 router.post('/:projectId/documents', upload.single('document'), projectController.uploadDocument);
 

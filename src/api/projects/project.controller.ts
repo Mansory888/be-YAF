@@ -3,6 +3,7 @@ import { Request, Response, NextFunction } from 'express';
 import * as projectService from './project.service';
 import * as qaService from './qa.service';
 import ingestionQueue from '../../services/queue.service';
+import { UnsupportedFileTypeError } from '../../core/documentExtractor'; // <-- IMPORT THE CUSTOM ERROR
 
 
 export async function listProjects(req: Request, res: Response, next: NextFunction) {
@@ -133,6 +134,21 @@ export async function uploadDocument(req: Request, res: Response, next: NextFunc
         );
 
         res.status(201).json({ message: 'Document uploaded and indexed successfully.', document });
+    } catch (error) {
+        // MODIFIED: Catch specific error for unsupported file types
+        if (error instanceof UnsupportedFileTypeError) {
+            return res.status(400).json({ error: error.message });
+        }
+        next(error);
+    }
+}
+
+// NEW: Controller for project stats
+export async function getProjectStats(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const stats = await projectService.getProjectStats(projectId);
+        res.json(stats);
     } catch (error) {
         next(error);
     }

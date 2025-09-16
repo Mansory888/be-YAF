@@ -7,6 +7,7 @@ import { chunkText } from '../../core/textChunker';
 import { getEmbedding } from '../../services/openai';
 import fs from 'fs/promises';
 import pgvector from 'pgvector/pg';
+import { extractTextFromFile } from '../../core/documentExtractor'; // <-- IMPORT THE NEW EXTRACTOR
 
 export async function getAllProjects() {
     const client = await getDbClient();
@@ -77,8 +78,8 @@ export async function addProjectDocument(projectId: number, originalFilename: st
     const client = await getDbClient();
     await client.query('BEGIN');
     try {
-        // 1. Read the content of the uploaded file
-        const content = await fs.readFile(storedFilePath, 'utf-8');
+        // MODIFIED: Pass both the stored path AND the original filename to the extractor.
+        const content = await extractTextFromFile(storedFilePath, originalFilename);
 
         // 2. Insert document metadata
         const docResult = await client.query(
@@ -87,11 +88,12 @@ export async function addProjectDocument(projectId: number, originalFilename: st
         );
         const documentId = docResult.rows[0].id;
 
-        // 3. Chunk the text content
+        // 3. Chunk the text content (now it's clean text)
         const chunks = chunkText(content);
 
         // 4. Embed and insert each chunk
         for (const chunk of chunks) {
+            // This call is now safe from token overflows
             const embedding = await getEmbedding(chunk);
             await client.query(
                 'INSERT INTO document_chunks (document_id, content, embedding) VALUES ($1, $2, $3)',
@@ -100,12 +102,81 @@ export async function addProjectDocument(projectId: number, originalFilename: st
         }
 
         await client.query('COMMIT');
-        return { id: documentId, file_name: originalFilename };
+        return { id: documentId, file_name: originalFilename, file_path: storedFilePath };
     } catch (error) {
         await client.query('ROLLBACK');
-        // Clean up the uploaded file on error
-        await fs.unlink(storedFilePath).catch(e => console.error("Failed to clean up file:", e));
+        console.error(`Failed to process document ${originalFilename}:`, error);
         throw error;
+    } finally {
+        await client.end();
+    }
+}
+
+// NEW: Function to get comprehensive stats for a project
+export async function getProjectStats(projectId: number) {
+    const client = await getDbClient();
+    try {
+        // Run queries in parallel for efficiency
+        const [
+            fileStatsRes,
+            taskStatsRes,
+            docStatsRes,
+            commitHistoryRes,
+            contributorRes
+        ] = await Promise.all([
+            // Query 1: Get counts of indexed files and code chunks
+            client.query(
+                `SELECT
+                    (SELECT COUNT(*) FROM indexed_files WHERE project_id = $1) as file_count,
+                    (SELECT COUNT(*) FROM code_chunks WHERE file_id IN (SELECT id FROM indexed_files WHERE project_id = $1)) as chunk_count`,
+                [projectId]
+            ),
+            // Query 2: Get task counts grouped by status
+            client.query(
+                `SELECT status, COUNT(*) as count FROM tasks WHERE project_id = $1 GROUP BY status`,
+                [projectId]
+            ),
+            // Query 3: Get count of uploaded documents
+            client.query(
+                `SELECT COUNT(*) as document_count FROM project_documents WHERE project_id = $1`,
+                [projectId]
+            ),
+            // Query 4: Get the 50 most recent commits (Git History)
+            client.query(
+                `SELECT commit_hash, author_name, commit_date, message FROM commits WHERE project_id = $1 ORDER BY commit_date DESC LIMIT 50`,
+                [projectId]
+            ),
+            // Query 5: Get the count of unique contributors
+            client.query(
+                `SELECT COUNT(DISTINCT author_name) as contributor_count FROM commits WHERE project_id = $1`,
+                [projectId]
+            )
+        ]);
+
+        // Process task stats into a more friendly object
+        const taskStats = taskStatsRes.rows.reduce((acc, row) => {
+            acc[row.status] = parseInt(row.count, 10);
+            return acc;
+        }, { open: 0, in_progress: 0, done: 0 });
+
+        const stats = {
+            files: {
+                count: parseInt(fileStatsRes.rows[0].file_count, 10),
+                chunks: parseInt(fileStatsRes.rows[0].chunk_count, 10),
+            },
+            tasks: taskStats,
+            documents: {
+                count: parseInt(docStatsRes.rows[0].document_count, 10),
+            },
+            git: {
+                commitCount: commitHistoryRes.rows.length, // Count from the returned limited list
+                contributorCount: parseInt(contributorRes.rows[0].contributor_count, 10),
+                history: commitHistoryRes.rows, // The actual commit objects
+            }
+        };
+
+        return stats;
+
     } finally {
         await client.end();
     }
