@@ -1,7 +1,7 @@
 // src/api/projects/project.service.ts
 import { getDbClient } from '../../services/db';
 import { cloneOrPullRepo } from '../../services/git';
-import { runIngestion } from '../../scripts/ingest';
+import { runIngestion, IngestionLogger } from '../../scripts/ingest'; // Import IngestionLogger
 import path from 'path';
 
 export async function getAllProjects() {
@@ -14,10 +14,24 @@ export async function getAllProjects() {
     }
 }
 
+export async function getProjectById(projectId: number) {
+    const client = await getDbClient();
+    try {
+        const { rows } = await client.query('SELECT * FROM projects WHERE id = $1', [projectId]);
+        if (rows.length === 0) {
+            return null;
+        }
+        return rows[0];
+    } finally {
+        await client.end();
+    }
+}
+
+
 export async function createProject(source: string) {
     const client = await getDbClient();
     try {
-        const existing = await client.query('SELECT id FROM projects WHERE source = $1', [source]);
+        const existing = await client.query('SELECT * FROM projects WHERE source = $1', [source]);
         if (existing.rows.length > 0) {
             // Project already exists, return it
             return { project: existing.rows[0], created: false };
@@ -34,13 +48,23 @@ export async function createProject(source: string) {
     }
 }
 
-export async function startProjectIngestion(projectId: number, source: string) {
+// MODIFIED: This function now accepts a logger and is the core logic for ingestion.
+export async function startProjectIngestion(projectId: number, source: string, logger: IngestionLogger) {
     try {
-        const projectPath = await cloneOrPullRepo(source);
-        console.log(`[Project ${projectId}] Ingestion running...`);
-        await runIngestion(projectId, projectPath);
-        console.log(`✅ [Project ${projectId}] Ingestion complete.`);
+        const projectPath = await cloneOrPullRepo(source, logger); // Pass logger to git service
+        logger(`[Project ${projectId}] Ingestion running...`);
+        await runIngestion(projectId, projectPath, logger);
+        logger(`✅ [Project ${projectId}] Ingestion complete.`);
     } catch (error) {
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger(`❌ [Project ${projectId}] Ingestion failed: ${errorMessage}`);
         console.error(`❌ [Project ${projectId}] Ingestion failed:`, error);
     }
+}
+
+// NEW HELPER for fire-and-forget ingestion
+export function startProjectIngestionInBackground(projectId: number, source: string) {
+    // We don't await this, so it runs in the background.
+    // Logs will go to the console.
+    startProjectIngestion(projectId, source, console.log);
 }

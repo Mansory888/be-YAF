@@ -1,17 +1,61 @@
 Project file structure:
 =======================
 ./
+    app.ts
     brain.ts
     server.ts
+    middleware/
+        errorHandler.ts
+    types/
+        tree-sitter-typescript.d.ts
     core/
         chunker.ts
     scripts/
         ingest.ts
+    api/
+        tasks/
+            task.controller.ts
+            task.routes.ts
+            task.service.ts
+        projects/
+            project.controller.ts
+            project.routes.ts
+            project.service.ts
+            qa.service.ts
+    services/
+        db.ts
+        git.ts
+        openai.ts
 
 
 File Contents:
 ===============
 
+
+--- FILE: app.ts ---
+
+// src/app.ts
+import 'dotenv/config';
+import express from 'express';
+import path from 'path';
+import projectRoutes from './api/projects/project.routes';
+import cors from 'cors';
+import { errorHandler } from './middleware/errorHandler';
+
+const app = express();
+app.use(cors());
+
+// Middleware
+app.use(express.json());
+app.use(express.static(path.join(process.cwd(), 'public')));
+
+// API Routes
+app.use('/api/projects', projectRoutes);
+
+// Error Handler
+app.use(errorHandler);
+
+export default app;
 
 --- FILE: brain.ts ---
 
@@ -32,7 +76,6 @@ import os from 'os';
 // --- CONFIGURATION ---
 const connectionString = process.env.DATABASE_URL!;
 const openaiApiKey = process.env.OPENAI_API_KEY!;
-// NEW: Define a persistent workspace directory in the user's home folder
 const WORKSPACE_DIR = path.join(os.homedir(), '.ai-brain-workspace');
 
 if (!connectionString || !openaiApiKey) {
@@ -42,6 +85,29 @@ const openai = new OpenAI({ apiKey: openaiApiKey });
 const program = new Command();
 
 // --- HELPER FUNCTIONS ---
+
+/**
+ * Retrieves the ID for a project from the database based on its source (Git URL or path).
+ * If the project doesn't exist, it creates a new one.
+ * @param source The unique Git URL or local path for the project.
+ * @param client The active Postgres client.
+ * @returns The numeric ID of the project.
+ */
+async function getProjectId(source: string, client: Client): Promise<number> {
+    const projectRes = await client.query('SELECT id FROM projects WHERE source = $1', [source]);
+    if (projectRes.rows.length > 0) {
+        return projectRes.rows[0].id;
+    } else {
+        const projectName = path.basename(source, path.extname(source));
+        console.log(`✨ Creating new project entry for '${projectName}'...`);
+        const newProjectRes = await client.query(
+            'INSERT INTO projects (name, source) VALUES ($1, $2) RETURNING id',
+            [projectName, source]
+        );
+        return newProjectRes.rows[0].id;
+    }
+}
+
 async function getEmbedding(text: string): Promise<number[]> {
   const response = await openai.embeddings.create({
     model: 'text-embedding-3-small',
@@ -50,26 +116,18 @@ async function getEmbedding(text: string): Promise<number[]> {
   return response.data[0].embedding;
 }
 
-/**
- * Creates a stable, filesystem-safe directory path from a Git URL.
- * This ensures the same URL always maps to the same local folder.
- * e.g., https://github.com/foo/bar.git -> ~/.ai-brain-workspace/github.com/foo/bar
- */
 function getWorkspacePathFromUrl(url: string): string {
     try {
         const parsedUrl = new URL(url);
-        // a.com/b/c.git -> a.com/b/c
         const cleanPath = (parsedUrl.hostname + parsedUrl.pathname).replace(/\.git$/, '');
         return path.join(WORKSPACE_DIR, cleanPath);
     } catch (e) {
-        // Handle SSH URLs like git@github.com:foo/bar.git
         const sshMatch = url.match(/git@([^:]+):(.*)/);
         if (sshMatch) {
             const host = sshMatch[1];
             const repoPath = sshMatch[2].replace(/\.git$/, '');
             return path.join(WORKSPACE_DIR, host, repoPath);
         }
-        // Fallback for other formats by replacing non-alphanumeric chars
         return path.join(WORKSPACE_DIR, url.replace(/[^a-zA-Z0-9]/g, '_'));
     }
 }
@@ -83,24 +141,16 @@ program
   .action(async (source: string) => {
     let projectPath = source;
 
-    // If the source is a URL, manage it in the persistent workspace
     if (source.startsWith('http') || source.startsWith('git@')) {
         projectPath = getWorkspacePathFromUrl(source);
-        
         try {
-            // Ensure the base workspace directory exists
             await fs.mkdir(WORKSPACE_DIR, { recursive: true });
-
-            // Check if the repo has already been cloned
             try {
-                await fs.access(path.join(projectPath, '.git')); // Check for .git dir
-                // It exists, so pull the latest changes
+                await fs.access(path.join(projectPath, '.git'));
                 console.log(`🧠 Found existing repository. Fetching updates from ${source}...`);
-                const git: SimpleGit = simpleGit(projectPath);
-                await git.pull();
+                await simpleGit(projectPath).pull();
                 console.log(`   -> Updates pulled successfully.`);
             } catch (error) {
-                // It doesn't exist, so clone it
                 console.log(`🧠 Cloning repository from ${source}...`);
                 await simpleGit().clone(source, projectPath);
                 console.log(`   -> Cloned successfully into: ${projectPath}`);
@@ -111,32 +161,38 @@ program
         }
     }
 
+    const client = new Client({ connectionString });
     try {
-      await runIngestion(projectPath);
+      await client.connect();
+      const projectId = await getProjectId(source, client);
+      await runIngestion(projectId, projectPath);
       console.log('✅ Ingestion complete.');
     } catch (error) {
       console.error('❌ Ingestion failed:', error);
       process.exit(1);
+    } finally {
+      await client.end();
     }
   });
 
-// The `ask` command (remains unchanged)
 program
   .command('ask')
   .description('Ask a question about the indexed codebase.')
   .argument('<question>', 'The question to ask')
-  .action(async (question: string) => {
+  .requiredOption('-p, --project <source>', 'The project source (Git URL or local path)')
+  .action(async (question: string, options: { project: string }) => {
     console.log(`🧠 Thinking about: "${question}"`);
     const client = new Client({ connectionString });
     try {
       await client.connect();
       await pgvector.registerType(client);
+      const projectId = await getProjectId(options.project, client);
 
       const questionEmbedding = await getEmbedding(question);
 
       const { rows: relevantFiles } = await client.query(
-        `SELECT id, path, summary FROM indexed_files ORDER BY summary_embedding <=> $1 LIMIT 5`,
-        [pgvector.toSql(questionEmbedding)]
+        `SELECT id, path, summary FROM indexed_files WHERE project_id = $1 ORDER BY summary_embedding <=> $2 LIMIT 5`,
+        [projectId, pgvector.toSql(questionEmbedding)]
       );
       
       if (relevantFiles.length === 0) {
@@ -148,11 +204,7 @@ program
       const relevantFileIds = relevantFiles.map(f => f.id);
 
       const { rows: contextChunks } = await client.query(
-        `SELECT file_id, content, chunk_name 
-         FROM code_chunks 
-         WHERE file_id = ANY($1::int[])
-         ORDER BY embedding <=> $2 
-         LIMIT 10`,
+        `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
         [relevantFileIds, pgvector.toSql(questionEmbedding)]
       );
 
@@ -188,106 +240,92 @@ program
     }
   });
 
+// --- NEW: TASK MANAGEMENT COMMANDS ---
+const task = program.command('task').description('Manage project tasks');
+
+task
+  .command('add')
+  .description('Add a new task to a project')
+  .argument('<title>', 'The title of the task')
+  .requiredOption('-p, --project <source>', 'The project source (Git URL or local path)')
+  .action(async (title: string, options: { project: string }) => {
+    const client = new Client({ connectionString });
+    try {
+        await client.connect();
+        const projectId = await getProjectId(options.project, client);
+        const result = await client.query(
+            'INSERT INTO tasks (project_id, title) VALUES ($1, $2) RETURNING task_number',
+            [projectId, title]
+        );
+        const taskNumber = result.rows[0].task_number;
+        console.log(`✅ Created task #${taskNumber}: "${title}"`);
+    } catch (error) {
+        console.error('❌ Could not add task:', error);
+    } finally {
+        await client.end();
+    }
+  });
+
+task
+  .command('list')
+  .description('List tasks for a project')
+  .requiredOption('-p, --project <source>', 'The project source (Git URL or local path)')
+  .option('--status <status>', 'Filter by status (e.g., open, done)', 'open')
+  .action(async (options: { project: string, status: string }) => {
+    const client = new Client({ connectionString });
+    try {
+        await client.connect();
+        const projectId = await getProjectId(options.project, client);
+        const { rows } = await client.query(
+            'SELECT task_number, title, status FROM tasks WHERE project_id = $1 AND status = $2 ORDER BY task_number ASC',
+            [projectId, options.status]
+        );
+
+        if (rows.length === 0) {
+            console.log(`No '${options.status}' tasks found for project: ${options.project}`);
+            return;
+        }
+
+        console.log(`\nTasks for project: ${options.project} [Status: ${options.status}]`);
+        console.log('--------------------------------------------------');
+        rows.forEach(t => {
+            const status = `[${t.status.toUpperCase()}]`.padEnd(7);
+            console.log(`#${t.task_number.toString().padEnd(4)} ${status} ${t.title}`);
+        });
+        console.log('--------------------------------------------------');
+    } catch (error) {
+        console.error('❌ Could not list tasks:', error);
+    } finally {
+        await client.end();
+    }
+  });
+
 program.parse(process.argv);
 
 --- FILE: server.ts ---
 
-import 'dotenv/config';
-import express from 'express';
-import path from 'path';
-import { Client } from 'pg';
-import OpenAI from 'openai';
-import pgvector from 'pgvector/pg'; // ✅ correct import
+// src/server.ts
+import app from './app';
 
-// --- CONFIGURATION & VALIDATION ---
-const app = express();
-const port = 3000;
-const connectionString = process.env.DATABASE_URL!;
-const openaiApiKey = process.env.OPENAI_API_KEY!;
+const port = process.env.PORT || 3000;
 
-if (!connectionString || !openaiApiKey) {
-    throw new Error("FATAL: Missing environment variables DATABASE_URL or OPENAI_API_KEY");
-}
-const openai = new OpenAI({ apiKey: openaiApiKey });
-
-// --- MIDDLEWARE ---
-app.use(express.json());
-app.use(express.static(path.join(process.cwd(), 'public')));
-
-// --- HELPER FUNCTION ---
-async function getEmbedding(text: string): Promise<number[]> {
-  const response = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: text.replace(/\n/g, ' '),
-  });
-  return response.data[0].embedding;
-}
-
-// --- API ENDPOINT ---
-app.post('/api/ask', async (req, res) => {
-    const { question } = req.body;
-    if (!question) {
-        return res.status(400).json({ error: 'Question is required.' });
-    }
-    console.log(`Received question: ${question}`);
-
-    const client = new Client({ connectionString });
-    try {
-        await client.connect();
-
-        // ✅ REGISTER THE VECTOR TYPE FOR THE QUERY
-        await pgvector.registerType(client);
-        
-        const questionEmbedding = await getEmbedding(question);
-
-        console.log('Querying for similar chunks...');
-        const { rows: contextChunks } = await client.query(
-            `SELECT file_path, content, embedding <=> $1 AS distance
-             FROM code_chunks
-             ORDER BY distance
-             LIMIT 10`,
-            [pgvector.toSql(questionEmbedding)] // ✅ USE THE HELPER TO FORMAT THE VECTOR
-        );
-        
-        console.log(`Found ${contextChunks.length} relevant chunks.`);
-        if (contextChunks.length > 0) {
-            console.log('Top result distance:', contextChunks[0].distance);
-        }
-
-        if (contextChunks.length === 0) {
-            return res.json({ answer: "I couldn't find any relevant context in the codebase to answer that." });
-        }
-
-        const contextString = contextChunks.map(c => `--- FILE: ${c.file_path} ---\n\n${c.content}`).join('\n\n');
-        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided code context. Be concise and accurate. Format code blocks using Markdown. If the context is insufficient, say so.`;
-        const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
-
-        const stream = await openai.chat.completions.create({
-            model: 'gpt-4o',
-            messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
-            stream: true,
-        });
-
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        for await (const chunk of stream) {
-            res.write(chunk.choices[0]?.delta?.content || '');
-        }
-        res.end();
-    } catch (error) {
-        console.error('Error in /api/ask:', error);
-        res.status(500).json({ error: 'An internal server error occurred.' });
-    } finally {
-        // Ensure the client is always closed
-        if (client) {
-            await client.end();
-        }
-    }
-});
-
-// --- START SERVER ---
 app.listen(port, () => {
     console.log(`🧠 AI Project Brain is listening at http://localhost:${port}`);
 });
+
+--- FILE: middleware/errorHandler.ts ---
+
+// src/middleware/errorHandler.ts
+import { Request, Response, NextFunction } from 'express';
+
+export function errorHandler(err: Error, req: Request, res: Response, next: NextFunction) {
+    console.error(err.stack);
+    res.status(500).json({ error: err.message || 'An internal server error occurred.' });
+}
+
+--- FILE: types/tree-sitter-typescript.d.ts ---
+
+declare module 'tree-sitter-typescript/typescript';
 
 --- FILE: core/chunker.ts ---
 
@@ -429,59 +467,50 @@ async function summarizeFile(filePath: string, content: string): Promise<string>
 }
 
 // --- MAIN INGESTION LOGIC ---
-export async function runIngestion(projectPath: string) {
+export async function runIngestion(projectId: number, projectPath: string) {
   const client = new Client({ connectionString });
   await client.connect();
   await pgvector.registerType(client);
   console.log('Database connection established.');
 
-  // FIX: Initialize simple-git here, using the provided projectPath.
   const git: SimpleGit = simpleGit(projectPath);
 
   try {
-    // FIX: Pass the projectPath to syncFiles.
-    await syncFiles(client, projectPath);
-    // FIX: Pass the initialized git instance to syncGitHistory.
-    await syncGitHistory(client, git);
+    await syncFiles(client, projectId, projectPath);
+    await syncGitHistory(client, projectId, git);
   } finally {
-    console.log('Ingestion complete. Closing database connection.');
+    console.log('Ingestion process finished. Closing database connection.');
     await client.end();
   }
 }
 
 // --- STAGE 1: Sync Filesystem State ---
-// FIX: Update function signature to accept projectPath.
-async function syncFiles(client: Client, projectPath: string) {
-  console.log(`[1/4] Starting file sync for project: ${projectPath}`);
+async function syncFiles(client: Client, projectId: number, projectPath: string) {
+  console.log(`[1/4] Starting file sync for project ID: ${projectId}`);
   
-  // --- NEW: PRUNING STEP ---
   console.log(`[2/4] Pruning deleted files from the database...`);
-  // Get all file paths currently in the database
-  const { rows: dbFiles } = await client.query('SELECT path FROM indexed_files');
+  const { rows: dbFiles } = await client.query('SELECT path FROM indexed_files WHERE project_id = $1', [projectId]);
   const dbPaths = new Set(dbFiles.map(f => f.path));
-
-  // Get all file paths currently on disk
+  
   const allDiskFiles = await glob('**/*', { cwd: projectPath, nodir: true, dot: true, ignore: ['**/node_modules/**', '**/.git/**'] });
   const diskPaths = new Set(allDiskFiles);
 
-  // Find paths that are in the DB but NOT on disk
   const pathsToDelete = [...dbPaths].filter(p => !diskPaths.has(p));
 
   if (pathsToDelete.length > 0) {
-    console.log(`      Found ${pathsToDelete.length} files to delete:`, pathsToDelete.join(', '));
-    await client.query('DELETE FROM indexed_files WHERE path = ANY($1::text[])', [pathsToDelete]);
+    console.log(`      Found ${pathsToDelete.length} files to delete.`);
+    await client.query('DELETE FROM indexed_files WHERE project_id = $1 AND path = ANY($2::text[])', [projectId, pathsToDelete]);
     console.log(`      -> Pruning complete.`);
   } else {
     console.log(`      -> No files to prune.`);
   }
-  // --- END OF PRUNING STEP ---
 
   const gitignorePath = path.join(projectPath, '.gitignore');
   const ignore = fs.existsSync(gitignorePath)
     ? gitignore.compile(fs.readFileSync(gitignorePath, 'utf8'))
     : { accepts: (_p: string) => true };
 
-  const filesToIndex = allDiskFiles.filter(file => { // Reuse the glob result
+  const filesToIndex = allDiskFiles.filter(file => {
     const ext = path.extname(file);
     const filename = path.basename(file);
     return ignore.accepts(file) && !IGNORED_EXTENSIONS.has(ext) && !IGNORED_FILENAMES.has(filename);
@@ -495,8 +524,8 @@ async function syncFiles(client: Client, projectPath: string) {
     const content = fs.readFileSync(fullPath, 'utf-8');
     if (!content.trim()) continue;
 
-    const hash = crypto.createHash('sha256').update(content).digest('hex');
-    const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE path = $1', [relativePath]);
+    const hash = crypto.createHash('sha265').update(content).digest('hex');
+    const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
 
     if (rows.length > 0 && rows[0].content_hash === hash) {
       continue;
@@ -507,12 +536,14 @@ async function syncFiles(client: Client, projectPath: string) {
 
     await client.query('BEGIN');
     try {
-      await client.query('DELETE FROM indexed_files WHERE path = $1', [relativePath]);
+      await client.query('DELETE FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
+      
       const summary = await summarizeFile(relativePath, content);
       const summaryEmbedding = await getEmbedding(summary);
+      
       const fileInsertResult = await client.query(
-        'INSERT INTO indexed_files (path, content_hash, summary, summary_embedding, last_indexed_at) VALUES ($1, $2, $3, $4, NOW()) RETURNING id',
-        [relativePath, hash, summary, pgvector.toSql(summaryEmbedding)]
+        'INSERT INTO indexed_files (project_id, path, content_hash, summary, summary_embedding, last_indexed_at) VALUES ($1, $2, $3, $4, $5, NOW()) RETURNING id',
+        [projectId, relativePath, hash, summary, pgvector.toSql(summaryEmbedding)]
       );
       const fileId = fileInsertResult.rows[0].id;
       
@@ -534,15 +565,13 @@ async function syncFiles(client: Client, projectPath: string) {
 }
 
 // --- STAGE 2: Sync Git Commit History ---
-// FIX: Update function signature to accept the git instance.
-async function syncGitHistory(client: Client, git: SimpleGit) {
+async function syncGitHistory(client: Client, projectId: number, git: SimpleGit) {
     console.log('\n[1/3] Starting Git history sync...');
     
-    const { rows: existingCommits } = await client.query('SELECT commit_hash FROM commits');
+    const { rows: existingCommits } = await client.query('SELECT commit_hash FROM commits WHERE project_id = $1', [projectId]);
     const existingHashes = new Set(existingCommits.map(c => c.commit_hash));
     console.log(`[2/3] Found ${existingHashes.size} existing commits in the database.`);
 
-    // FIX: Use the passed git instance.
     const log = await git.log();
     const allCommits = [...log.all].reverse();
 
@@ -560,8 +589,8 @@ async function syncGitHistory(client: Client, git: SimpleGit) {
         try {
             const messageEmbedding = await getEmbedding(commit.message);
             const commitInsertResult = await client.query(
-                `INSERT INTO commits (commit_hash, author_name, author_email, commit_date, message, embedding) VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-                [commit.hash, commit.author_name, commit.author_email, commit.date, commit.message, pgvector.toSql(messageEmbedding)]
+                `INSERT INTO commits (project_id, commit_hash, author_name, author_email, commit_date, message, embedding) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+                [projectId, commit.hash, commit.author_name, commit.author_email, commit.date, commit.message, pgvector.toSql(messageEmbedding)]
             );
             const commitId = commitInsertResult.rows[0].id;
             
@@ -574,7 +603,7 @@ async function syncGitHistory(client: Client, git: SimpleGit) {
                 const change_type = parts[0].trim();
                 const file_path = parts[1].trim();
                 
-                const { rows } = await client.query('SELECT id FROM indexed_files WHERE path = $1', [file_path]);
+                const { rows } = await client.query('SELECT id FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, file_path]);
 
                 if (rows.length > 0) {
                     const fileId = rows[0].id;
@@ -584,6 +613,22 @@ async function syncGitHistory(client: Client, git: SimpleGit) {
                     );
                 }
             }
+
+            // NEW: Check commit message for task-closing keywords
+            const taskRegex = /(?:closes|fixes|resolves)\s+#(\d+)/gi;
+            let match;
+            while ((match = taskRegex.exec(commit.message)) !== null) {
+                const taskNumber = parseInt(match[1], 10);
+                console.log(`      -> Found reference to close task #${taskNumber}.`);
+                const updateResult = await client.query(
+                    `UPDATE tasks SET status = 'done', updated_at = NOW() WHERE project_id = $1 AND task_number = $2 AND status != 'done'`,
+                    [projectId, taskNumber]
+                );
+                if (updateResult.rowCount && updateResult.rowCount > 0) {
+                    console.log(`      ✅ Automatically closed task #${taskNumber}.`);
+                }
+            }
+
             await client.query('COMMIT');
         } catch (error) {
             await client.query('ROLLBACK');
@@ -591,4 +636,402 @@ async function syncGitHistory(client: Client, git: SimpleGit) {
         }
     }
     console.log('[3/3] Git history sync complete.');
+}
+
+--- FILE: api/tasks/task.controller.ts ---
+
+// src/api/tasks/task.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import * as taskService from './task.service';
+
+export async function listTasks(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const status = req.query.status as string | undefined; // Allow undefined
+        const tasks = await taskService.getTasks(projectId, status);
+        res.json(tasks);
+    } catch (error) {
+        next(error);
+    }
+}
+
+// ADD THIS FUNCTION
+export async function createTask(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const { title } = req.body;
+        if (!title) {
+            return res.status(400).json({ error: 'A "title" is required.' });
+        }
+        const newTask = await taskService.createTask(projectId, title);
+        res.status(201).json(newTask);
+    } catch (error) {
+        next(error);
+    }
+}
+
+// ADD THIS FUNCTION
+export async function updateTask(req: Request, res: Response, next: NextFunction) {
+    try {
+        const { projectId, taskNumber } = req.params;
+        const { status } = req.body;
+        
+        const updatedTask = await taskService.updateTask(
+            parseInt(projectId, 10),
+            parseInt(taskNumber, 10),
+            status
+        );
+        res.json(updatedTask);
+    } catch (error) {
+        next(error);
+    }
+}
+
+--- FILE: api/tasks/task.routes.ts ---
+
+// src/api/tasks/task.routes.ts
+import { Router } from 'express';
+import * as taskController from './task.controller';
+
+const router = Router({ mergeParams: true }); // mergeParams is crucial for nested routes
+
+router.get('/', taskController.listTasks);
+router.post('/', taskController.createTask); 
+router.put('/:taskNumber', taskController.updateTask); 
+
+export default router;
+
+--- FILE: api/tasks/task.service.ts ---
+
+// src/api/tasks/task.service.ts
+import { getDbClient } from '../../services/db';
+
+export async function getTasks(projectId: number, status?: string) {
+    const client = await getDbClient();
+    try {
+        let query = 'SELECT * FROM tasks WHERE project_id = $1';
+        const params: any[] = [projectId];
+        if (status) {
+            query += ' AND status = $2';
+            params.push(status);
+        }
+        query += ' ORDER BY task_number ASC';
+        const { rows } = await client.query(query, params);
+        return rows;
+    } finally {
+        // Use client.release() if using a pool, or client.end() for single client
+        await client.end();
+    }
+}
+
+// ADD THIS FUNCTION
+export async function createTask(projectId: number, title: string) {
+    const client = await getDbClient();
+    try {
+        const { rows } = await client.query(
+            'INSERT INTO tasks (project_id, title) VALUES ($1, $2) RETURNING *',
+            [projectId, title]
+        );
+        return rows[0];
+    } finally {
+        await client.end();
+    }
+}
+
+// ADD THIS FUNCTION
+export async function updateTask(projectId: number, taskNumber: number, status: string) {
+    const client = await getDbClient();
+    try {
+        // Ensure status is a valid one to prevent SQL injection with invalid enum values
+        if (!['open', 'in_progress', 'done'].includes(status)) {
+            throw new Error('Invalid task status');
+        }
+
+        const { rows } = await client.query(
+            `UPDATE tasks SET status = $1, updated_at = NOW() 
+             WHERE project_id = $2 AND task_number = $3 
+             RETURNING *`,
+            [status, projectId, taskNumber]
+        );
+        if (rows.length === 0) {
+            throw new Error('Task not found');
+        }
+        return rows[0];
+    } finally {
+        await client.end();
+    }
+}
+
+--- FILE: api/projects/project.controller.ts ---
+
+// src/api/projects/project.controller.ts
+import { Request, Response, NextFunction } from 'express';
+import * as projectService from './project.service';
+import * as qaService from './qa.service'; // We will create this next
+
+export async function listProjects(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projects = await projectService.getAllProjects();
+        res.json(projects);
+    } catch (error) {
+        next(error);
+    }
+}
+
+export async function addProject(req: Request, res: Response, next: NextFunction) {
+    try {
+        const { source } = req.body;
+        if (!source) {
+            return res.status(400).json({ error: 'A "source" Git URL is required.' });
+        }
+        
+        const { project, created } = await projectService.createProject(source);
+
+        if (!created) {
+            return res.status(200).json({ message: 'Project already exists.', project });
+        }
+        
+        // Respond immediately and start ingestion in the background
+        res.status(202).json({ message: 'Project created. Ingestion started.', project });
+        projectService.startProjectIngestion(project.id, project.source);
+
+    } catch (error) {
+        next(error);
+    }
+}
+
+export async function syncProject(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const { source } = req.body; // Assuming source is passed to find repo
+        
+        res.status(202).json({ message: 'Project sync started.' });
+        projectService.startProjectIngestion(projectId, source);
+    } catch (error) {
+        next(error);
+    }
+}
+
+export async function askQuestion(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const { question } = req.body;
+        if (!question) {
+            return res.status(400).json({ error: 'A "question" is required.' });
+        }
+        
+        const stream = await qaService.getAnswerStream(projectId, question);
+        
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        for await (const chunk of stream) {
+            res.write(chunk.choices[0]?.delta?.content || '');
+        }
+        res.end();
+
+    } catch (error) {
+        if (!res.headersSent) {
+          next(error);
+        } else {
+          console.error("Error during streaming:", error);
+          res.end();
+        }
+    }
+}
+
+--- FILE: api/projects/project.routes.ts ---
+
+// src/api/projects/project.routes.ts
+import { Router } from 'express';
+import * as projectController from './project.controller';
+import taskRoutes from '../tasks/task.routes';
+
+const router = Router();
+
+router.get('/', projectController.listProjects);
+router.post('/', projectController.addProject);
+router.post('/:projectId/sync', projectController.syncProject);
+router.post('/:projectId/ask', projectController.askQuestion);
+
+// Mount task routes nested under projects
+router.use('/:projectId/tasks', taskRoutes);
+
+export default router;
+
+--- FILE: api/projects/project.service.ts ---
+
+// src/api/projects/project.service.ts
+import { getDbClient } from '../../services/db';
+import { cloneOrPullRepo } from '../../services/git';
+import { runIngestion } from '../../scripts/ingest';
+import path from 'path';
+
+export async function getAllProjects() {
+    const client = await getDbClient();
+    try {
+        const { rows } = await client.query('SELECT id, name, source FROM projects ORDER BY created_at DESC');
+        return rows;
+    } finally {
+        await client.end();
+    }
+}
+
+export async function createProject(source: string) {
+    const client = await getDbClient();
+    try {
+        const existing = await client.query('SELECT id FROM projects WHERE source = $1', [source]);
+        if (existing.rows.length > 0) {
+            // Project already exists, return it
+            return { project: existing.rows[0], created: false };
+        }
+
+        const projectName = path.basename(source, path.extname(source));
+        const { rows } = await client.query(
+            'INSERT INTO projects (name, source) VALUES ($1, $2) RETURNING *',
+            [projectName, source]
+        );
+        return { project: rows[0], created: true };
+    } finally {
+        await client.end();
+    }
+}
+
+export async function startProjectIngestion(projectId: number, source: string) {
+    try {
+        const projectPath = await cloneOrPullRepo(source);
+        console.log(`[Project ${projectId}] Ingestion running...`);
+        await runIngestion(projectId, projectPath);
+        console.log(`✅ [Project ${projectId}] Ingestion complete.`);
+    } catch (error) {
+        console.error(`❌ [Project ${projectId}] Ingestion failed:`, error);
+    }
+}
+
+--- FILE: api/projects/qa.service.ts ---
+
+// src/api/projects/qa.service.ts
+import { getDbClient } from '../../services/db';
+import * as openAI from '../../services/openai';
+import pgvector from 'pgvector/pg';
+
+export async function getAnswerStream(projectId: number, question: string) {
+    const client = await getDbClient();
+    try {
+        const questionEmbedding = await openAI.getEmbedding(question);
+
+        const { rows: relevantFiles } = await client.query(
+            `SELECT id, path FROM indexed_files WHERE project_id = $1 ORDER BY summary_embedding <=> $2 LIMIT 5`,
+            [projectId, pgvector.toSql(questionEmbedding)]
+        );
+        
+        if (relevantFiles.length === 0) {
+            throw new Error("No relevant files found for this question.");
+        }
+
+        const relevantFileIds = relevantFiles.map(f => f.id);
+        const { rows: contextChunks } = await client.query(
+            `SELECT file_id, content, chunk_name FROM code_chunks WHERE file_id = ANY($1::int[]) ORDER BY embedding <=> $2 LIMIT 10`,
+            [relevantFileIds, pgvector.toSql(questionEmbedding)]
+        );
+
+        if (contextChunks.length === 0) {
+            throw new Error("No relevant code chunks found for this question.");
+        }
+
+        const contextString = contextChunks.map(c => {
+            const filePath = relevantFiles.find(f => f.id === c.file_id)?.path;
+            return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
+        }).join('\n\n');
+
+        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided code context. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
+        const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
+        
+        return openAI.getChatCompletionStream(systemPrompt, userPrompt);
+
+    } finally {
+        await client.end();
+    }
+}
+
+--- FILE: services/db.ts ---
+
+// src/services/db.ts
+import { Client } from 'pg';
+import pgvector from 'pgvector/pg';
+
+const connectionString = process.env.DATABASE_URL!;
+
+export async function getDbClient(): Promise<Client> {
+    const client = new Client({ connectionString });
+    await client.connect();
+    await pgvector.registerType(client);
+    return client;
+}
+
+--- FILE: services/git.ts ---
+
+// src/services/git.ts
+import simpleGit from 'simple-git';
+import { promises as fs } from 'fs';
+import path from 'path';
+import os from 'os';
+
+const WORKSPACE_DIR = path.join(os.homedir(), '.ai-brain-workspace');
+
+export function getWorkspacePathFromUrl(url: string): string {
+    try {
+        const parsedUrl = new URL(url);
+        const cleanPath = (parsedUrl.hostname + parsedUrl.pathname).replace(/\.git$/, '');
+        return path.join(WORKSPACE_DIR, cleanPath);
+    } catch (e) {
+        const sshMatch = url.match(/git@([^:]+):(.*)/);
+        if (sshMatch) {
+            const host = sshMatch[1];
+            const repoPath = sshMatch[2].replace(/\.git$/, '');
+            return path.join(WORKSPACE_DIR, host, repoPath);
+        }
+        return path.join(WORKSPACE_DIR, url.replace(/[^a-zA-Z0-9]/g, '_'));
+    }
+}
+
+export async function cloneOrPullRepo(source: string): Promise<string> {
+    const projectPath = getWorkspacePathFromUrl(source);
+    await fs.mkdir(WORKSPACE_DIR, { recursive: true });
+
+    try {
+        await fs.access(path.join(projectPath, '.git'));
+        console.log(`Found existing repository. Fetching updates from ${source}...`);
+        await simpleGit(projectPath).pull();
+    } catch (error) {
+        console.log(`Cloning repository from ${source}...`);
+        await simpleGit().clone(source, projectPath);
+    }
+    return projectPath;
+}
+
+--- FILE: services/openai.ts ---
+
+// src/services/openai.ts
+import OpenAI from 'openai';
+
+const openaiApiKey = process.env.OPENAI_API_KEY!;
+if (!openaiApiKey) {
+    throw new Error("FATAL: Missing environment variable OPENAI_API_KEY");
+}
+
+const openai = new OpenAI({ apiKey: openaiApiKey });
+
+export async function getEmbedding(text: string): Promise<number[]> {
+  const response = await openai.embeddings.create({
+    model: 'text-embedding-3-small',
+    input: text.replace(/\n/g, ' '),
+  });
+  return response.data[0].embedding;
+}
+
+export async function getChatCompletionStream(systemPrompt: string, userPrompt: string) {
+    return openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+        stream: true,
+    });
 }

@@ -24,6 +24,9 @@ const openai = new OpenAI({ apiKey: openaiApiKey });
 const IGNORED_EXTENSIONS = new Set(['.lock', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.ico']);
 const IGNORED_FILENAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
 
+// NEW: Define a logger type
+export type IngestionLogger = (message: string) => void;
+
 // --- CORE HELPER FUNCTIONS ---
 async function getEmbedding(text: string): Promise<number[]> {
   const response = await openai.embeddings.create({
@@ -33,7 +36,7 @@ async function getEmbedding(text: string): Promise<number[]> {
   return response.data[0].embedding;
 }
 
-async function summarizeFile(filePath: string, content: string): Promise<string> {
+async function summarizeFile(filePath: string, content: string, logger: IngestionLogger): Promise<string> {
   const prompt = `Summarize the purpose of the following code file in one sentence. File Path: ${filePath}\n\nCode:\n---\n${content}\n---\n\nOne-sentence summary:`;
   try {
     const response = await openai.chat.completions.create({
@@ -44,34 +47,34 @@ async function summarizeFile(filePath: string, content: string): Promise<string>
     });
     return response.choices[0].message.content?.trim() || "Could not generate a summary.";
   } catch (error) {
-    console.error(`  - Failed to summarize ${filePath}:`, error);
+    logger(`  - Failed to summarize ${filePath}: ${error instanceof Error ? error.message : String(error)}`);
     return "Summary generation failed.";
   }
 }
 
 // --- MAIN INGESTION LOGIC ---
-export async function runIngestion(projectId: number, projectPath: string) {
+export async function runIngestion(projectId: number, projectPath: string, logger: IngestionLogger) {
   const client = new Client({ connectionString });
   await client.connect();
   await pgvector.registerType(client);
-  console.log('Database connection established.');
+  logger('Database connection established.');
 
   const git: SimpleGit = simpleGit(projectPath);
 
   try {
-    await syncFiles(client, projectId, projectPath);
-    await syncGitHistory(client, projectId, git);
+    await syncFiles(client, projectId, projectPath, logger);
+    await syncGitHistory(client, projectId, git, logger);
   } finally {
-    console.log('Ingestion process finished. Closing database connection.');
+    logger('Ingestion process finished. Closing database connection.');
     await client.end();
   }
 }
 
 // --- STAGE 1: Sync Filesystem State ---
-async function syncFiles(client: Client, projectId: number, projectPath: string) {
-  console.log(`[1/4] Starting file sync for project ID: ${projectId}`);
+async function syncFiles(client: Client, projectId: number, projectPath: string, logger: IngestionLogger) {
+  logger(`[1/4] Starting file sync for project ID: ${projectId}`);
   
-  console.log(`[2/4] Pruning deleted files from the database...`);
+  logger(`[2/4] Pruning deleted files from the database...`);
   const { rows: dbFiles } = await client.query('SELECT path FROM indexed_files WHERE project_id = $1', [projectId]);
   const dbPaths = new Set(dbFiles.map(f => f.path));
   
@@ -81,11 +84,11 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
   const pathsToDelete = [...dbPaths].filter(p => !diskPaths.has(p));
 
   if (pathsToDelete.length > 0) {
-    console.log(`      Found ${pathsToDelete.length} files to delete.`);
+    logger(`      Found ${pathsToDelete.length} files to delete.`);
     await client.query('DELETE FROM indexed_files WHERE project_id = $1 AND path = ANY($2::text[])', [projectId, pathsToDelete]);
-    console.log(`      -> Pruning complete.`);
+    logger(`      -> Pruning complete.`);
   } else {
-    console.log(`      -> No files to prune.`);
+    logger(`      -> No files to prune.`);
   }
 
   const gitignorePath = path.join(projectPath, '.gitignore');
@@ -99,7 +102,7 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
     return ignore.accepts(file) && !IGNORED_EXTENSIONS.has(ext) && !IGNORED_FILENAMES.has(filename);
   });
 
-  console.log(`[3/4] Found ${filesToIndex.length} files to process for additions/modifications.`);
+  logger(`[3/4] Found ${filesToIndex.length} files to process for additions/modifications.`);
   let processedCount = 0;
 
   for (const relativePath of filesToIndex) {
@@ -107,7 +110,7 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
     const content = fs.readFileSync(fullPath, 'utf-8');
     if (!content.trim()) continue;
 
-    const hash = crypto.createHash('sha265').update(content).digest('hex');
+    const hash = crypto.createHash('sha256').update(content).digest('hex'); // Corrected from sha265
     const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
 
     if (rows.length > 0 && rows[0].content_hash === hash) {
@@ -115,13 +118,13 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
     }
 
     processedCount++;
-    console.log(`      Processing changed file: ${relativePath}`);
+    logger(`      Processing changed file: ${relativePath}`);
 
     await client.query('BEGIN');
     try {
       await client.query('DELETE FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
       
-      const summary = await summarizeFile(relativePath, content);
+      const summary = await summarizeFile(relativePath, content, logger);
       const summaryEmbedding = await getEmbedding(summary);
       
       const fileInsertResult = await client.query(
@@ -141,32 +144,32 @@ async function syncFiles(client: Client, projectId: number, projectPath: string)
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
-      console.error(`      Failed to process ${relativePath}:`, error);
+      logger(`      Failed to process ${relativePath}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
-  console.log(`[4/4] File sync complete. Processed ${processedCount} new or changed files.`);
+  logger(`[4/4] File sync complete. Processed ${processedCount} new or changed files.`);
 }
 
 // --- STAGE 2: Sync Git Commit History ---
-async function syncGitHistory(client: Client, projectId: number, git: SimpleGit) {
-    console.log('\n[1/3] Starting Git history sync...');
+async function syncGitHistory(client: Client, projectId: number, git: SimpleGit, logger: IngestionLogger) {
+    logger('\n[1/3] Starting Git history sync...');
     
     const { rows: existingCommits } = await client.query('SELECT commit_hash FROM commits WHERE project_id = $1', [projectId]);
     const existingHashes = new Set(existingCommits.map(c => c.commit_hash));
-    console.log(`[2/3] Found ${existingHashes.size} existing commits in the database.`);
+    logger(`[2/3] Found ${existingHashes.size} existing commits in the database.`);
 
     const log = await git.log();
     const allCommits = [...log.all].reverse();
 
     const newCommits = allCommits.filter(c => !existingHashes.has(c.hash));
     if (newCommits.length === 0) {
-        console.log('[3/3] Git history is already up-to-date.');
+        logger('[3/3] Git history is already up-to-date.');
         return;
     }
-    console.log(`      Found ${newCommits.length} new commits to process.`);
+    logger(`      Found ${newCommits.length} new commits to process.`);
 
     for (const commit of newCommits) {
-        console.log(`      Processing commit ${commit.hash.substring(0, 7)}: ${commit.message}`);
+        logger(`      Processing commit ${commit.hash.substring(0, 7)}: ${commit.message}`);
         
         await client.query('BEGIN');
         try {
@@ -202,21 +205,21 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit)
             let match;
             while ((match = taskRegex.exec(commit.message)) !== null) {
                 const taskNumber = parseInt(match[1], 10);
-                console.log(`      -> Found reference to close task #${taskNumber}.`);
+                logger(`      -> Found reference to close task #${taskNumber}.`);
                 const updateResult = await client.query(
                     `UPDATE tasks SET status = 'done', updated_at = NOW() WHERE project_id = $1 AND task_number = $2 AND status != 'done'`,
                     [projectId, taskNumber]
                 );
                 if (updateResult.rowCount && updateResult.rowCount > 0) {
-                    console.log(`      ✅ Automatically closed task #${taskNumber}.`);
+                    logger(`      ✅ Automatically closed task #${taskNumber}.`);
                 }
             }
 
             await client.query('COMMIT');
         } catch (error) {
             await client.query('ROLLBACK');
-            console.error(`      Failed to process commit ${commit.hash}:`, error);
+            logger(`      Failed to process commit ${commit.hash}: ${error instanceof Error ? error.message : String(error)}`);
         }
     }
-    console.log('[3/3] Git history sync complete.');
+    logger('[3/3] Git history sync complete.');
 }

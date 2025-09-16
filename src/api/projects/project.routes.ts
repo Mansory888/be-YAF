@@ -7,7 +7,10 @@ const router = Router();
 
 router.get('/', projectController.listProjects);
 router.post('/', projectController.addProject);
-router.post('/:projectId/sync', projectController.syncProject);
+
+// MODIFIED: This is now a GET request to establish an SSE connection for logs
+router.get('/:projectId/sync-stream', projectController.streamIngestionLogs);
+
 router.post('/:projectId/ask', projectController.askQuestion);
 
 // Mount task routes nested under projects

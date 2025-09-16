@@ -1,7 +1,7 @@
 // src/api/projects/project.controller.ts
 import { Request, Response, NextFunction } from 'express';
 import * as projectService from './project.service';
-import * as qaService from './qa.service'; // We will create this next
+import * as qaService from './qa.service';
 
 export async function listProjects(req: Request, res: Response, next: NextFunction) {
     try {
@@ -26,25 +26,61 @@ export async function addProject(req: Request, res: Response, next: NextFunction
         }
         
         // Respond immediately and start ingestion in the background
-        res.status(202).json({ message: 'Project created. Ingestion started.', project });
-        projectService.startProjectIngestion(project.id, project.source);
+        res.status(202).json({ message: 'Project created. Ingestion will start in the background.', project });
+        projectService.startProjectIngestionInBackground(project.id, project.source);
 
     } catch (error) {
         next(error);
     }
 }
 
-export async function syncProject(req: Request, res: Response, next: NextFunction) {
+// REMOVED old syncProject, which is replaced by streamIngestionLogs
+
+// NEW: Controller for streaming ingestion logs
+export async function streamIngestionLogs(req: Request, res: Response, next: NextFunction) {
+    const projectId = parseInt(req.params.projectId, 10);
+    
+    // Set headers for SSE
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders(); // Flush the headers to establish the connection
+
+    const logger = (message: string) => {
+        // Format message for SSE
+        res.write(`data: ${JSON.stringify({ log: message })}\n\n`);
+    };
+
+    // Handle client disconnect
+    req.on('close', () => {
+        console.log(`Client disconnected from ingestion stream for project ${projectId}.`);
+        res.end();
+    });
+
     try {
-        const projectId = parseInt(req.params.projectId, 10);
-        const { source } = req.body; // Assuming source is passed to find repo
+        const project = await projectService.getProjectById(projectId);
+        if (!project) {
+            logger(`Error: Project with ID ${projectId} not found.`);
+            res.end();
+            return;
+        }
         
-        res.status(202).json({ message: 'Project sync started.' });
-        projectService.startProjectIngestion(projectId, source);
+        // Start the ingestion and wait for it to complete, streaming logs along the way
+        await projectService.startProjectIngestion(projectId, project.source, logger);
+        
+        // Signal the end of the stream
+        res.write('event: end\ndata: {"message": "Ingestion complete"}\n\n');
+        res.end();
+
     } catch (error) {
-        next(error);
+        const errorMessage = error instanceof Error ? error.message : String(error);
+        logger(`FATAL ERROR: ${errorMessage}`);
+        console.error("Error during ingestion stream:", error);
+        res.write(`event: error\ndata: {"message": "${errorMessage}"}\n\n`);
+        res.end();
     }
 }
+
 
 export async function askQuestion(req: Request, res: Response, next: NextFunction) {
     try {
