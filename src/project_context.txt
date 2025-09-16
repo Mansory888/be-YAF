@@ -10,6 +10,10 @@ Project file structure:
         tree-sitter-typescript.d.ts
     core/
         chunker.ts
+        textChunker.ts
+        prompts/
+            fileSummary.prompt.ts
+            taskGeneration.prompt.ts
     scripts/
         ingest.ts
     api/
@@ -26,6 +30,7 @@ Project file structure:
         db.ts
         git.ts
         openai.ts
+        queue.service.ts
 
 
 File Contents:
@@ -446,6 +451,158 @@ export function chunkCodeWithAST(content: string): CodeChunk[] {
   return chunks;
 }
 
+--- FILE: core/textChunker.ts ---
+
+// --- FILE: core/textChunker.ts ---
+import { remark } from 'remark';
+import { toString } from 'mdast-util-to-string';
+import { Root } from 'mdast';
+
+/**
+ * A fallback chunker for plain text with no discernible structure.
+ * It splits the content by paragraphs (double newlines).
+ */
+function chunkByParagraphs(content: string): string[] {
+    return content
+        .split(/\n\s*\n/)
+        .map(chunk => chunk.trim())
+        .filter(chunk => chunk.length > 20); // Filter out very short lines
+}
+
+/**
+ * A sophisticated chunker that understands Markdown structure.
+ * It groups content under headings to create semantically meaningful chunks.
+ * For example, a "## Section Title" and all its following paragraphs and lists
+ * will be combined into a single chunk.
+ */
+function chunkByHeadings(markdownContent: string): string[] {
+    const tree = remark().parse(markdownContent) as Root;
+    const chunks: string[] = [];
+    let currentChunk: any[] = [];
+
+    tree.children.forEach(node => {
+        // A heading of level 1 or 2 always starts a new chunk.
+        if (node.type === 'heading' && (node.depth === 1 || node.depth === 2)) {
+            // If we have a pending chunk, push it to the main array.
+            if (currentChunk.length > 0) {
+                chunks.push(toString({ type: 'root', children: currentChunk }));
+            }
+            // Start a new chunk with the current heading.
+            currentChunk = [node];
+        } else {
+            // Otherwise, append the node to the current chunk.
+            currentChunk.push(node);
+        }
+    });
+
+    // Add the last remaining chunk.
+    if (currentChunk.length > 0) {
+        chunks.push(toString({ type: 'root', children: currentChunk }));
+    }
+
+    // If the document had no headings, the whole thing is one chunk.
+    // In that case, we fall back to the paragraph chunker for better granularity.
+    if (chunks.length === 1 && tree.children.some(node => node.type !== 'heading')) {
+        return chunkByParagraphs(chunks[0]);
+    }
+    
+    return chunks.filter(chunk => chunk.trim().length > 0);
+}
+
+/**
+ * The main text chunking function. It attempts to chunk by Markdown headings first,
+ * and falls back to a simpler paragraph-based chunker if needed.
+ * @param content The text or markdown content to be chunked.
+ * @returns An array of string chunks.
+ */
+export function chunkText(content: string): string[] {
+    // Trim initial/final whitespace which can affect parsing
+    const trimmedContent = content.trim();
+    if (!trimmedContent) {
+        return [];
+    }
+    return chunkByHeadings(trimmedContent);
+}
+
+--- FILE: core/prompts/fileSummary.prompt.ts ---
+
+// --- FILE: core/prompts/fileSummary.prompt.ts ---
+
+/**
+ * Generates the prompt for summarizing a single code file.
+ * @param filePath The relative path of the file.
+ * @param content The full content of the file.
+ * @returns A formatted string ready to be sent to the OpenAI API.
+ */
+export function generateFileSummaryPrompt(filePath: string, content: string): string {
+    return `Summarize the purpose of the following code file in one sentence. Be concise and focus on the file's primary role or responsibility.
+
+File Path: ${filePath}
+
+--- CODE START ---
+${content}
+--- CODE END ---
+
+One-sentence summary:`;
+}
+
+--- FILE: core/prompts/taskGeneration.prompt.ts ---
+
+// --- FILE: core/prompts/taskGeneration.prompt.ts ---
+
+/**
+ * Generates the full prompt for the AI to analyze a git commit and create a structured task.
+ * @param commitMessage The message from the git commit.
+ * @param gitDiff The full text diff of the changes in the commit.
+ * @returns A formatted string ready to be sent to the OpenAI API.
+ */
+export function generateTaskFromCommitPrompt(commitMessage: string, gitDiff: string): string {
+    return `You are an expert software engineering project manager analyzing a git commit. Your goal is to generate a concise task title, a category, and a detailed description of the work.
+
+**Instructions & Rules:**
+
+1.  **Analyze**: Carefully review the commit message and the git diff to understand the full context of the work performed.
+2.  **Output Format**: You MUST respond ONLY with a single JSON object. Do not include any explanatory text, markdown syntax, or anything outside of the JSON structure.
+3.  **Trivial Commits**: If the diff is truly trivial (e.g., only a typo fix in a comment, a whitespace change), respond with the exact string "NULL" instead of a JSON object.
+4.  **JSON Structure**: The JSON object must have three keys: "title", "category", and "description".
+
+    *   **"title" field rules:**
+        *   MUST start with an imperative verb (e.g., "Add", "Refactor", "Fix", "Update", "Implement").
+        *   MUST be a single, concise line summarizing the work done.
+
+    *   **"category" field rules:**
+        *   MUST be one of the following exact strings: 'feature', 'fix', 'refactor', 'chore', 'docs', 'test'.
+
+    *   **"description" field rules:**
+        *   MUST be a brief, one or two-sentence summary of the changes.
+        *   This summary SHOULD be followed by a short markdown bulleted list of the most important changes.
+        *   Example: "This commit introduces a new queueing system to handle concurrent ingestion tasks. Key changes include:\n- Added 'p-queue' library.\n- Created a singleton queue service.\n- Wrapped the ingestion logic in the project controller."
+
+**JSON Output Structure Example:**
+\`\`\`json
+{
+  "title": "Implement a queue for ingestion tasks",
+  "category": "feature",
+  "description": "Introduces a job queue to manage concurrent project sync requests, preventing system crashes under load. Key changes include:\\n- Added 'p-queue' dependency.\\n- Created a global singleton queue service with a concurrency of 1.\\n- Modified the project controller to add ingestion jobs to the queue."
+}
+\`\`\`
+
+---
+**INPUT DATA**
+---
+
+**COMMIT MESSAGE:**
+\`\`\`
+${commitMessage}
+\`\`\`
+
+**GIT DIFF:**
+\`\`\`diff
+${gitDiff}
+\`\`\`
+`;
+}
+
 --- FILE: scripts/ingest.ts ---
 
 // --- FILE: scripts/ingest.ts ---
@@ -460,7 +617,10 @@ import OpenAI from 'openai';
 import gitignore from 'gitignore-parser';
 import pgvector from 'pgvector/pg';
 import { chunkCodeWithAST } from '../core/chunker';
-import simpleGit, { SimpleGit } from 'simple-git';
+import simpleGit, { SimpleGit, LogResult, DefaultLogFields } from 'simple-git';
+// REFACTORED: Import both dedicated prompt generators
+import { generateFileSummaryPrompt } from '../core/prompts/fileSummary.prompt';
+import { generateTaskFromCommitPrompt } from '../core/prompts/taskGeneration.prompt';
 
 // --- CONFIGURATION (Global) ---
 const connectionString = process.env.DATABASE_URL!;
@@ -474,7 +634,6 @@ const openai = new OpenAI({ apiKey: openaiApiKey });
 const IGNORED_EXTENSIONS = new Set(['.lock', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.ico']);
 const IGNORED_FILENAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
 
-// NEW: Define a logger type
 export type IngestionLogger = (message: string) => void;
 
 // --- CORE HELPER FUNCTIONS ---
@@ -486,8 +645,9 @@ async function getEmbedding(text: string): Promise<number[]> {
   return response.data[0].embedding;
 }
 
+// REFACTORED: This function now uses the imported prompt
 async function summarizeFile(filePath: string, content: string, logger: IngestionLogger): Promise<string> {
-  const prompt = `Summarize the purpose of the following code file in one sentence. File Path: ${filePath}\n\nCode:\n---\n${content}\n---\n\nOne-sentence summary:`;
+  const prompt = generateFileSummaryPrompt(filePath, content);
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
@@ -521,6 +681,7 @@ export async function runIngestion(projectId: number, projectPath: string, logge
 }
 
 // --- STAGE 1: Sync Filesystem State ---
+// This function remains the same, but its call to summarizeFile is now cleaner.
 async function syncFiles(client: Client, projectId: number, projectPath: string, logger: IngestionLogger) {
   logger(`[1/4] Starting file sync for project ID: ${projectId}`);
   
@@ -560,7 +721,7 @@ async function syncFiles(client: Client, projectId: number, projectPath: string,
     const content = fs.readFileSync(fullPath, 'utf-8');
     if (!content.trim()) continue;
 
-    const hash = crypto.createHash('sha256').update(content).digest('hex'); // Corrected from sha265
+    const hash = crypto.createHash('sha256').update(content).digest('hex');
     const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
 
     if (rows.length > 0 && rows[0].content_hash === hash) {
@@ -601,6 +762,68 @@ async function syncFiles(client: Client, projectId: number, projectPath: string,
 }
 
 // --- STAGE 2: Sync Git Commit History ---
+
+// REFACTORED: This function now uses the imported prompt
+async function generateTaskFromCommit(client: Client, projectId: number, commit: DefaultLogFields, git: SimpleGit, logger: IngestionLogger) {
+    const diff = await git.show(['--patch', '--first-parent', commit.hash]);
+    
+    if (!diff || diff.trim().length < 50) { 
+        logger(`      -> Commit ${commit.hash.substring(0,7)} is trivial, skipping task generation.`);
+        return;
+    }
+
+    const prompt = generateTaskFromCommitPrompt(commit.message, diff);
+
+    try {
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [{ role: 'user', content: prompt }],
+            response_format: { type: 'json_object' },
+            max_tokens: 400, // Increased token limit for more detailed descriptions
+            temperature: 0.1,
+        });
+        
+        const responseText = response.choices[0].message.content?.trim();
+
+        if (!responseText || responseText.toUpperCase() === 'NULL') {
+            logger(`      -> AI determined commit is trivial, skipping task generation.`);
+            return;
+        }
+
+        // MODIFIED: Destructure the new 'description' field
+        const { title, category, description } = JSON.parse(responseText);
+
+        if (!title || !category || !description) {
+            throw new Error('AI response was missing title, category, or description.');
+        }
+
+        logger(`      -> AI generated task: [${category}] "${title}"`);
+
+        // MODIFIED: The content to embed now includes the more detailed description
+        const contentToEmbed = `[${category}] ${title}\n\n${description}\n\nCompleted in commit: ${commit.hash}`;
+        const taskEmbedding = await getEmbedding(contentToEmbed);
+
+        await client.query(
+            `INSERT INTO tasks (project_id, title, description, status, category, embedding, created_at, updated_at) 
+             VALUES ($1, $2, $3, 'done', $4, $5, $6, $6)`,
+            [
+                projectId, 
+                title, 
+                // MODIFIED: Use the AI-generated description
+                description,
+                category,
+                pgvector.toSql(taskEmbedding),
+                commit.date
+            ]
+        );
+        logger(`      ✅ Created and closed retrospective task for commit ${commit.hash.substring(0,7)}.`);
+
+    } catch (error) {
+        logger(`      ❌ Failed to generate task for commit ${commit.hash.substring(0,7)}: ${error instanceof Error ? error.message : 'Unknown AI or parsing error'}`);
+    }
+}
+
+// This function now contains the core orchestration logic for git history.
 async function syncGitHistory(client: Client, projectId: number, git: SimpleGit, logger: IngestionLogger) {
     logger('\n[1/3] Starting Git history sync...');
     
@@ -608,7 +831,7 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
     const existingHashes = new Set(existingCommits.map(c => c.commit_hash));
     logger(`[2/3] Found ${existingHashes.size} existing commits in the database.`);
 
-    const log = await git.log();
+    const log: LogResult<DefaultLogFields> = await git.log();
     const allCommits = [...log.all].reverse();
 
     const newCommits = allCommits.filter(c => !existingHashes.has(c.hash));
@@ -630,8 +853,8 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
             );
             const commitId = commitInsertResult.rows[0].id;
             
-            const diff = await git.show(['--name-status', '--pretty=format:', commit.hash]);
-            const changedFiles = diff.split('\n').filter(line => line.trim());
+            const diffSummary = await git.show(['--name-status', '--pretty=format:', commit.hash]);
+            const changedFiles = diffSummary.split('\n').filter(line => line.trim());
 
             for (const line of changedFiles) {
                 const parts = line.split('\t');
@@ -650,10 +873,10 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
                 }
             }
 
-            // NEW: Check commit message for task-closing keywords
             const taskRegex = /(?:closes|fixes|resolves)\s+#(\d+)/gi;
-            let match;
-            while ((match = taskRegex.exec(commit.message)) !== null) {
+            const match = taskRegex.exec(commit.message);
+
+            if (match) {
                 const taskNumber = parseInt(match[1], 10);
                 logger(`      -> Found reference to close task #${taskNumber}.`);
                 const updateResult = await client.query(
@@ -663,6 +886,8 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
                 if (updateResult.rowCount && updateResult.rowCount > 0) {
                     logger(`      ✅ Automatically closed task #${taskNumber}.`);
                 }
+            } else {
+                await generateTaskFromCommit(client, projectId, commit, git, logger);
             }
 
             await client.query('COMMIT');
@@ -861,6 +1086,8 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
 import { Request, Response, NextFunction } from 'express';
 import * as projectService from './project.service';
 import * as qaService from './qa.service';
+import ingestionQueue from '../../services/queue.service';
+
 
 export async function listProjects(req: Request, res: Response, next: NextFunction) {
     try {
@@ -899,45 +1126,54 @@ export async function addProject(req: Request, res: Response, next: NextFunction
 export async function streamIngestionLogs(req: Request, res: Response, next: NextFunction) {
     const projectId = parseInt(req.params.projectId, 10);
     
-    // Set headers for SSE
     res.setHeader('Content-Type', 'text/event-stream');
     res.setHeader('Cache-Control', 'no-cache');
     res.setHeader('Connection', 'keep-alive');
-    res.flushHeaders(); // Flush the headers to establish the connection
+    res.flushHeaders();
 
     const logger = (message: string) => {
-        // Format message for SSE
-        res.write(`data: ${JSON.stringify({ log: message })}\n\n`);
+        if (!res.writableEnded) {
+            res.write(`data: ${JSON.stringify({ log: message })}\n\n`);
+        }
     };
 
-    // Handle client disconnect
     req.on('close', () => {
         console.log(`Client disconnected from ingestion stream for project ${projectId}.`);
         res.end();
     });
 
-    try {
-        const project = await projectService.getProjectById(projectId);
-        if (!project) {
-            logger(`Error: Project with ID ${projectId} not found.`);
-            res.end();
-            return;
-        }
-        
-        // Start the ingestion and wait for it to complete, streaming logs along the way
-        await projectService.startProjectIngestion(projectId, project.source, logger);
-        
-        // Signal the end of the stream
-        res.write('event: end\ndata: {"message": "Ingestion complete"}\n\n');
-        res.end();
+    // MODIFIED: Wrap the entire ingestion logic in the queue
+    ingestionQueue.add(async () => {
+        try {
+            const project = await projectService.getProjectById(projectId);
+            if (!project) {
+                logger(`Error: Project with ID ${projectId} not found.`);
+                return; // Return from the job, not the outer function
+            }
+            
+            logger('Your sync request is now being processed...');
+            await projectService.startProjectIngestion(projectId, project.source, logger);
+            
+            logger('Ingestion complete.');
+            res.write('event: end\ndata: {"message": "Ingestion complete"}\n\n');
 
-    } catch (error) {
-        const errorMessage = error instanceof Error ? error.message : String(error);
-        logger(`FATAL ERROR: ${errorMessage}`);
-        console.error("Error during ingestion stream:", error);
-        res.write(`event: error\ndata: {"message": "${errorMessage}"}\n\n`);
-        res.end();
-    }
+        } catch (error) {
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            logger(`FATAL ERROR: ${errorMessage}`);
+            console.error("Error during ingestion stream:", error);
+            res.write(`event: error\ndata: {"message": "${errorMessage}"}\n\n`);
+        } finally {
+            if (!res.writableEnded) {
+                res.end();
+            }
+        }
+    }).catch((err:any) => {
+        // This catch is for errors adding the job to the queue itself, which is rare.
+        console.error("Failed to add ingestion job to queue:", err);
+        if (!res.writableEnded) {
+            res.status(500).send("Failed to queue the ingestion job.");
+        }
+    });
 }
 
 
@@ -967,14 +1203,35 @@ export async function askQuestion(req: Request, res: Response, next: NextFunctio
     }
 }
 
+export async function uploadDocument(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        if (!req.file) {
+            return res.status(400).json({ error: 'No file uploaded.' });
+        }
+        
+        const document = await projectService.addProjectDocument(
+            projectId,
+            req.file.originalname,
+            req.file.path
+        );
+
+        res.status(201).json({ message: 'Document uploaded and indexed successfully.', document });
+    } catch (error) {
+        next(error);
+    }
+}
+
 --- FILE: api/projects/project.routes.ts ---
 
 // src/api/projects/project.routes.ts
 import { Router } from 'express';
 import * as projectController from './project.controller';
 import taskRoutes from '../tasks/task.routes';
+import multer from 'multer';
 
 const router = Router();
+const upload = multer({ dest: 'uploads/' });
 
 router.get('/', projectController.listProjects);
 router.post('/', projectController.addProject);
@@ -983,6 +1240,7 @@ router.post('/', projectController.addProject);
 router.get('/:projectId/sync-stream', projectController.streamIngestionLogs);
 
 router.post('/:projectId/ask', projectController.askQuestion);
+router.post('/:projectId/documents', upload.single('document'), projectController.uploadDocument);
 
 // Mount task routes nested under projects
 router.use('/:projectId/tasks', taskRoutes);
@@ -996,6 +1254,10 @@ import { getDbClient } from '../../services/db';
 import { cloneOrPullRepo } from '../../services/git';
 import { runIngestion, IngestionLogger } from '../../scripts/ingest'; // Import IngestionLogger
 import path from 'path';
+import { chunkText } from '../../core/textChunker';
+import { getEmbedding } from '../../services/openai';
+import fs from 'fs/promises';
+import pgvector from 'pgvector/pg';
 
 export async function getAllProjects() {
     const client = await getDbClient();
@@ -1062,6 +1324,44 @@ export function startProjectIngestionInBackground(projectId: number, source: str
     startProjectIngestion(projectId, source, console.log);
 }
 
+export async function addProjectDocument(projectId: number, originalFilename: string, storedFilePath: string) {
+    const client = await getDbClient();
+    await client.query('BEGIN');
+    try {
+        // 1. Read the content of the uploaded file
+        const content = await fs.readFile(storedFilePath, 'utf-8');
+
+        // 2. Insert document metadata
+        const docResult = await client.query(
+            'INSERT INTO project_documents (project_id, file_name, file_path) VALUES ($1, $2, $3) RETURNING id',
+            [projectId, originalFilename, storedFilePath]
+        );
+        const documentId = docResult.rows[0].id;
+
+        // 3. Chunk the text content
+        const chunks = chunkText(content);
+
+        // 4. Embed and insert each chunk
+        for (const chunk of chunks) {
+            const embedding = await getEmbedding(chunk);
+            await client.query(
+                'INSERT INTO document_chunks (document_id, content, embedding) VALUES ($1, $2, $3)',
+                [documentId, chunk, pgvector.toSql(embedding)]
+            );
+        }
+
+        await client.query('COMMIT');
+        return { id: documentId, file_name: originalFilename };
+    } catch (error) {
+        await client.query('ROLLBACK');
+        // Clean up the uploaded file on error
+        await fs.unlink(storedFilePath).catch(e => console.error("Failed to clean up file:", e));
+        throw error;
+    } finally {
+        await client.end();
+    }
+}
+
 --- FILE: api/projects/qa.service.ts ---
 
 // src/api/projects/qa.service.ts
@@ -1075,7 +1375,7 @@ export async function getAnswerStream(projectId: number, question: string) {
         const questionEmbedding = await openAI.getEmbedding(question);
         let contextString = '';
 
-        // --- Retrieve relevant tasks ---
+        // --- Retrieve relevant tasks (no change) ---
         const { rows: relevantTasks } = await client.query(
             `SELECT task_number, title, status FROM tasks WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
             [projectId, pgvector.toSql(questionEmbedding)]
@@ -1084,7 +1384,7 @@ export async function getAnswerStream(projectId: number, question: string) {
             contextString += "Relevant Tasks:\n" + relevantTasks.map(t => `- Task #${t.task_number} [${t.status.toUpperCase()}]: ${t.title}`).join('\n') + '\n\n';
         }
 
-        // --- Retrieve relevant commits ---
+        // --- Retrieve relevant commits (no change) ---
         const { rows: relevantCommits } = await client.query(
             `SELECT commit_hash, message, author_name FROM commits WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
             [projectId, pgvector.toSql(questionEmbedding)]
@@ -1093,8 +1393,34 @@ export async function getAnswerStream(projectId: number, question: string) {
             contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
         }
 
+        // --- MODIFIED: Retrieve relevant project documents with error handling ---
+        try {
+            const { rows: relevantDocChunks } = await client.query(
+                `SELECT
+                   pd.file_name,
+                   dc.content
+                 FROM document_chunks dc
+                 JOIN project_documents pd ON dc.document_id = pd.id
+                 WHERE pd.project_id = $1
+                 ORDER BY dc.embedding <=> $2
+                 LIMIT 3`,
+                [projectId, pgvector.toSql(questionEmbedding)]
+            );
+            if (relevantDocChunks.length > 0) {
+                contextString += "Relevant Project Documents:\n" + relevantDocChunks.map(d => `--- FROM DOCUMENT: ${d.file_name} ---\n\n${d.content}`).join('\n\n') + '\n\n';
+            }
+        } catch (error: any) {
+            // If the table doesn't exist, this query will fail. We catch the error
+            // and log a warning instead of crashing the application.
+            if (error.code === '42P01') { // 42P01 is the PostgreSQL code for "undefined_table"
+                 console.warn('Warning: project_documents or document_chunks table not found. Skipping document search. Run migrations to enable this feature.');
+            } else {
+                // For any other unexpected error, we still throw it.
+                throw error;
+            }
+        }
 
-        // --- Retrieve relevant files and code chunks ---
+        // --- Retrieve relevant files and code chunks (no change) ---
         const { rows: relevantFiles } = await client.query(
             `SELECT id, path FROM indexed_files WHERE project_id = $1 ORDER BY summary_embedding <=> $2 LIMIT 5`,
             [projectId, pgvector.toSql(questionEmbedding)]
@@ -1120,8 +1446,7 @@ export async function getAnswerStream(projectId: number, question: string) {
             throw new Error("No relevant context found for this question (no tasks, commits, or code).");
         }
 
-
-        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
+        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include project documents, tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
         const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
         
         return openAI.getChatCompletionStream(systemPrompt, userPrompt);
@@ -1219,3 +1544,15 @@ export async function getChatCompletionStream(systemPrompt: string, userPrompt: 
         stream: true,
     });
 }
+
+--- FILE: services/queue.service.ts ---
+
+// --- FILE: services/queue.service.ts ---
+import PQueue from 'p-queue';
+
+// Create a single, shared queue for the entire application.
+// concurrency: 1 ensures that only one promise runs at a time.
+// This is our lock to prevent multiple ingestions from running simultaneously.
+const ingestionQueue = new PQueue({ concurrency: 1 });
+
+export default ingestionQueue;
