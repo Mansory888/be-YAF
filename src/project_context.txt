@@ -676,6 +676,8 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
 
 --- FILE: api/tasks/task.controller.ts ---
 
+// --- FILE: api/tasks/task.controller.ts ---
+
 // src/api/tasks/task.controller.ts
 import { Request, Response, NextFunction } from 'express';
 import * as taskService from './task.service';
@@ -691,31 +693,31 @@ export async function listTasks(req: Request, res: Response, next: NextFunction)
     }
 }
 
-// ADD THIS FUNCTION
+// MODIFIED: Handle 'description' field from the body
 export async function createTask(req: Request, res: Response, next: NextFunction) {
     try {
         const projectId = parseInt(req.params.projectId, 10);
-        const { title } = req.body;
+        const { title, description } = req.body; // <-- Get description here
         if (!title) {
             return res.status(400).json({ error: 'A "title" is required.' });
         }
-        const newTask = await taskService.createTask(projectId, title);
+        const newTask = await taskService.createTask(projectId, title, description); // <-- Pass it here
         res.status(201).json(newTask);
     } catch (error) {
         next(error);
     }
 }
 
-// ADD THIS FUNCTION
+// MODIFIED: Handle multiple fields for update
 export async function updateTask(req: Request, res: Response, next: NextFunction) {
     try {
         const { projectId, taskNumber } = req.params;
-        const { status } = req.body;
+        const { title, description, status } = req.body; // <-- Get all potential updates
         
         const updatedTask = await taskService.updateTask(
             parseInt(projectId, 10),
             parseInt(taskNumber, 10),
-            status
+            { title, description, status } // <-- Pass as an object
         );
         res.json(updatedTask);
     } catch (error) {
@@ -738,6 +740,8 @@ router.put('/:taskNumber', taskController.updateTask);
 export default router;
 
 --- FILE: api/tasks/task.service.ts ---
+
+// --- FILE: api/tasks/task.service.ts ---
 
 // src/api/tasks/task.service.ts
 import { getDbClient } from '../../services/db';
@@ -762,17 +766,19 @@ export async function getTasks(projectId: number, status?: string) {
     }
 }
 
-export async function createTask(projectId: number, title: string) {
+// MODIFIED: Accept description and include it in the embedding and insert
+export async function createTask(projectId: number, title: string, description?: string) {
     const client = await getDbClient();
     try {
-        const titleEmbedding = await getEmbedding(title);
+        const contentToEmbed = `${title}${description ? `\n\n${description}` : ''}`;
+        const titleEmbedding = await getEmbedding(contentToEmbed);
         const { rows } = await client.query(
-            'INSERT INTO tasks (project_id, title, embedding) VALUES ($1, $2, $3) RETURNING *',
-            [projectId, title, pgvector.toSql(titleEmbedding)]
+            'INSERT INTO tasks (project_id, title, description, embedding) VALUES ($1, $2, $3, $4) RETURNING *',
+            [projectId, title, description || null, pgvector.toSql(titleEmbedding)]
         );
         return rows[0];
     } catch (error) {
-        console.error('Task creation failed. Ensure the `tasks` table has an `embedding` column.');
+        console.error('Task creation failed. Ensure the `tasks` table has `description` and `embedding` columns.');
         throw error;
     }
     finally {
@@ -780,23 +786,69 @@ export async function createTask(projectId: number, title: string) {
     }
 }
 
-export async function updateTask(projectId: number, taskNumber: number, status: string) {
+// MODIFIED: Allow updating title, description, and status
+interface TaskUpdates {
+    title?: string;
+    description?: string;
+    status?: 'open' | 'in_progress' | 'done';
+}
+
+export async function updateTask(projectId: number, taskNumber: number, updates: TaskUpdates) {
     const client = await getDbClient();
     try {
-        // Ensure status is a valid one to prevent SQL injection with invalid enum values
-        if (!['open', 'in_progress', 'done'].includes(status)) {
-            throw new Error('Invalid task status');
-        }
-
-        const { rows } = await client.query(
-            `UPDATE tasks SET status = $1, updated_at = NOW() 
-             WHERE project_id = $2 AND task_number = $3 
-             RETURNING *`,
-            [status, projectId, taskNumber]
+        const { rows: existingTasks } = await client.query(
+            'SELECT title, description FROM tasks WHERE project_id = $1 AND task_number = $2',
+            [projectId, taskNumber]
         );
-        if (rows.length === 0) {
+
+        if (existingTasks.length === 0) {
             throw new Error('Task not found');
         }
+
+        const currentTask = existingTasks[0];
+        const newTitle = updates.title || currentTask.title;
+        const newDescription = updates.description || currentTask.description;
+
+        const fieldsToUpdate = [];
+        const values = [];
+        let paramIndex = 1;
+
+        if (updates.status) {
+            if (!['open', 'in_progress', 'done'].includes(updates.status)) {
+                throw new Error('Invalid task status');
+            }
+            fieldsToUpdate.push(`status = $${paramIndex++}`);
+            values.push(updates.status);
+        }
+        if (updates.title) {
+            fieldsToUpdate.push(`title = $${paramIndex++}`);
+            values.push(updates.title);
+        }
+        if (updates.description) {
+            fieldsToUpdate.push(`description = $${paramIndex++}`);
+            values.push(updates.description);
+        }
+
+        // If title or description changed, re-calculate the embedding
+        if (updates.title || updates.description) {
+            const contentToEmbed = `${newTitle}${newDescription ? `\n\n${newDescription}` : ''}`;
+            const newEmbedding = await getEmbedding(contentToEmbed);
+            fieldsToUpdate.push(`embedding = $${paramIndex++}`);
+            values.push(pgvector.toSql(newEmbedding));
+        }
+
+        if (fieldsToUpdate.length === 0) {
+            return currentTask; // Nothing to update
+        }
+
+        fieldsToUpdate.push(`updated_at = NOW()`);
+        
+        values.push(projectId, taskNumber);
+
+        const query = `UPDATE tasks SET ${fieldsToUpdate.join(', ')} WHERE project_id = $${paramIndex++} AND task_number = $${paramIndex++} RETURNING *`;
+        
+        const { rows } = await client.query(query, values);
+
         return rows[0];
     } finally {
         await client.end();

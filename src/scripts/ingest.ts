@@ -10,7 +10,10 @@ import OpenAI from 'openai';
 import gitignore from 'gitignore-parser';
 import pgvector from 'pgvector/pg';
 import { chunkCodeWithAST } from '../core/chunker';
-import simpleGit, { SimpleGit } from 'simple-git';
+import simpleGit, { SimpleGit, LogResult, DefaultLogFields } from 'simple-git';
+// REFACTORED: Import both dedicated prompt generators
+import { generateFileSummaryPrompt } from '../core/prompts/fileSummary.prompt';
+import { generateTaskFromCommitPrompt } from '../core/prompts/taskGeneration.prompt';
 
 // --- CONFIGURATION (Global) ---
 const connectionString = process.env.DATABASE_URL!;
@@ -24,7 +27,6 @@ const openai = new OpenAI({ apiKey: openaiApiKey });
 const IGNORED_EXTENSIONS = new Set(['.lock', '.svg', '.png', '.jpg', '.jpeg', '.gif', '.ico']);
 const IGNORED_FILENAMES = new Set(['package-lock.json', 'yarn.lock', 'pnpm-lock.yaml']);
 
-// NEW: Define a logger type
 export type IngestionLogger = (message: string) => void;
 
 // --- CORE HELPER FUNCTIONS ---
@@ -36,8 +38,9 @@ async function getEmbedding(text: string): Promise<number[]> {
   return response.data[0].embedding;
 }
 
+// REFACTORED: This function now uses the imported prompt
 async function summarizeFile(filePath: string, content: string, logger: IngestionLogger): Promise<string> {
-  const prompt = `Summarize the purpose of the following code file in one sentence. File Path: ${filePath}\n\nCode:\n---\n${content}\n---\n\nOne-sentence summary:`;
+  const prompt = generateFileSummaryPrompt(filePath, content);
   try {
     const response = await openai.chat.completions.create({
       model: 'gpt-4o',
@@ -71,6 +74,7 @@ export async function runIngestion(projectId: number, projectPath: string, logge
 }
 
 // --- STAGE 1: Sync Filesystem State ---
+// This function remains the same, but its call to summarizeFile is now cleaner.
 async function syncFiles(client: Client, projectId: number, projectPath: string, logger: IngestionLogger) {
   logger(`[1/4] Starting file sync for project ID: ${projectId}`);
   
@@ -110,7 +114,7 @@ async function syncFiles(client: Client, projectId: number, projectPath: string,
     const content = fs.readFileSync(fullPath, 'utf-8');
     if (!content.trim()) continue;
 
-    const hash = crypto.createHash('sha256').update(content).digest('hex'); // Corrected from sha265
+    const hash = crypto.createHash('sha256').update(content).digest('hex');
     const { rows } = await client.query('SELECT content_hash FROM indexed_files WHERE project_id = $1 AND path = $2', [projectId, relativePath]);
 
     if (rows.length > 0 && rows[0].content_hash === hash) {
@@ -151,6 +155,65 @@ async function syncFiles(client: Client, projectId: number, projectPath: string,
 }
 
 // --- STAGE 2: Sync Git Commit History ---
+
+// REFACTORED: This function now uses the imported prompt
+async function generateTaskFromCommit(client: Client, projectId: number, commit: DefaultLogFields, git: SimpleGit, logger: IngestionLogger) {
+    const diff = await git.show(['--patch', '--first-parent', commit.hash]);
+    
+    if (!diff || diff.trim().length < 50) { 
+        logger(`      -> Commit ${commit.hash.substring(0,7)} is trivial, skipping task generation.`);
+        return;
+    }
+
+    const prompt = generateTaskFromCommitPrompt(commit.message, diff);
+
+    try {
+        const response = await openai.chat.completions.create({
+            model: 'gpt-4o',
+            messages: [{ role: 'user', content: prompt }],
+            response_format: { type: 'json_object' },
+            max_tokens: 150,
+            temperature: 0.1,
+        });
+        
+        const responseText = response.choices[0].message.content?.trim();
+
+        if (!responseText || responseText.toUpperCase() === 'NULL') {
+            logger(`      -> AI determined commit is trivial, skipping task generation.`);
+            return;
+        }
+
+        const { title, category } = JSON.parse(responseText);
+
+        if (!title || !category) {
+            throw new Error('AI response was missing title or category.');
+        }
+
+        logger(`      -> AI generated task: [${category}] "${title}"`);
+
+        const contentToEmbed = `[${category}] ${title}\n\nCompleted in commit: ${commit.hash}`;
+        const taskEmbedding = await getEmbedding(contentToEmbed);
+
+        await client.query(
+            `INSERT INTO tasks (project_id, title, description, status, category, embedding, created_at, updated_at) 
+             VALUES ($1, $2, $3, 'done', $4, $5, $6, $6)`,
+            [
+                projectId, 
+                title, 
+                `Automatically generated from commit ${commit.hash.substring(0, 7)} by ${commit.author_name}.`,
+                category,
+                pgvector.toSql(taskEmbedding),
+                commit.date
+            ]
+        );
+        logger(`      ✅ Created and closed retrospective task for commit ${commit.hash.substring(0,7)}.`);
+
+    } catch (error) {
+        logger(`      ❌ Failed to generate task for commit ${commit.hash.substring(0,7)}: ${error instanceof Error ? error.message : 'Unknown AI or parsing error'}`);
+    }
+}
+
+// This function now contains the core orchestration logic for git history.
 async function syncGitHistory(client: Client, projectId: number, git: SimpleGit, logger: IngestionLogger) {
     logger('\n[1/3] Starting Git history sync...');
     
@@ -158,7 +221,7 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
     const existingHashes = new Set(existingCommits.map(c => c.commit_hash));
     logger(`[2/3] Found ${existingHashes.size} existing commits in the database.`);
 
-    const log = await git.log();
+    const log: LogResult<DefaultLogFields> = await git.log();
     const allCommits = [...log.all].reverse();
 
     const newCommits = allCommits.filter(c => !existingHashes.has(c.hash));
@@ -180,8 +243,8 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
             );
             const commitId = commitInsertResult.rows[0].id;
             
-            const diff = await git.show(['--name-status', '--pretty=format:', commit.hash]);
-            const changedFiles = diff.split('\n').filter(line => line.trim());
+            const diffSummary = await git.show(['--name-status', '--pretty=format:', commit.hash]);
+            const changedFiles = diffSummary.split('\n').filter(line => line.trim());
 
             for (const line of changedFiles) {
                 const parts = line.split('\t');
@@ -200,10 +263,10 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
                 }
             }
 
-            // NEW: Check commit message for task-closing keywords
             const taskRegex = /(?:closes|fixes|resolves)\s+#(\d+)/gi;
-            let match;
-            while ((match = taskRegex.exec(commit.message)) !== null) {
+            const match = taskRegex.exec(commit.message);
+
+            if (match) {
                 const taskNumber = parseInt(match[1], 10);
                 logger(`      -> Found reference to close task #${taskNumber}.`);
                 const updateResult = await client.query(
@@ -213,6 +276,8 @@ async function syncGitHistory(client: Client, projectId: number, git: SimpleGit,
                 if (updateResult.rowCount && updateResult.rowCount > 0) {
                     logger(`      ✅ Automatically closed task #${taskNumber}.`);
                 }
+            } else {
+                await generateTaskFromCommit(client, projectId, commit, git, logger);
             }
 
             await client.query('COMMIT');
