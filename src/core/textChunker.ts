@@ -26,28 +26,31 @@ function chunkByHeadings(markdownContent: string): string[] {
     let currentChunk: any[] = [];
 
     tree.children.forEach(node => {
-        // A heading of level 1 or 2 always starts a new chunk.
-        if (node.type === 'heading' && (node.depth === 1 || node.depth === 2)) {
-            // If we have a pending chunk, push it to the main array.
+        // A heading of level 1, 2, or 3 now starts a new chunk for better granularity.
+        if (node.type === 'heading' && node.depth <= 3) {
             if (currentChunk.length > 0) {
                 chunks.push(toString({ type: 'root', children: currentChunk }));
             }
-            // Start a new chunk with the current heading.
             currentChunk = [node];
         } else {
-            // Otherwise, append the node to the current chunk.
             currentChunk.push(node);
         }
     });
 
-    // Add the last remaining chunk.
     if (currentChunk.length > 0) {
         chunks.push(toString({ type: 'root', children: currentChunk }));
     }
 
+    // --- NEW LOGGING: START ---
+    console.log(`[textChunker] Initial chunking pass found ${chunks.length} potential chunks based on headings.`);
+    // --- NEW LOGGING: END ---
+
     // If the document had no headings, the whole thing is one chunk.
     // In that case, we fall back to the paragraph chunker for better granularity.
     if (chunks.length === 1 && tree.children.some(node => node.type !== 'heading')) {
+        // --- NEW LOGGING: START ---
+        console.log('[textChunker] Only one heading-based chunk found. Falling back to paragraph-based chunking for better granularity.');
+        // --- NEW LOGGING: END ---
         return chunkByParagraphs(chunks[0]);
     }
     

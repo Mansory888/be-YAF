@@ -10,6 +10,7 @@ Project file structure:
         tree-sitter-typescript.d.ts
     core/
         chunker.ts
+        documentExtractor.ts
         textChunker.ts
         prompts/
             fileSummary.prompt.ts
@@ -451,6 +452,100 @@ export function chunkCodeWithAST(content: string): CodeChunk[] {
   return chunks;
 }
 
+--- FILE: core/documentExtractor.ts ---
+
+// --- FILE: core/documentExtractor.ts ---
+import fs from 'fs';
+import path from 'path';
+import mammoth from 'mammoth';
+import pdf from 'pdf-parse';
+import TurndownService from 'turndown';
+
+export class UnsupportedFileTypeError extends Error {
+    constructor(message: string) {
+        super(message);
+        this.name = 'UnsupportedFileTypeError';
+    }
+}
+
+// MODIFIED: Create a Turndown instance and add a custom rule.
+const turndownService = new TurndownService();
+
+// This new rule identifies paragraphs that ONLY contain bold text and treats them as H2 headings.
+// This is a robust way to handle documents where users bold text for headers instead of using proper styles.
+turndownService.addRule('strongIsHeading', {
+    filter: (node, options) => {
+        // Check if the node is a paragraph
+        if (node.nodeName !== 'P') {
+            return false;
+        }
+        // Check if it has exactly one child
+        if (node.childNodes.length !== 1) {
+            return false;
+        }
+        const child = node.firstChild!;
+        // Check if that single child is a <strong> tag
+        if (child.nodeName !== 'STRONG') {
+            return false;
+        }
+        // Optional: Check if the heading text is reasonably short
+        return (child.textContent || '').length < 200;
+    },
+    replacement: (content) => {
+        // Replace it with a markdown H2 heading
+        return `## ${content}\n\n`;
+    }
+});
+
+
+/**
+ * Extracts clean text content from a file based on its extension.
+ * Supports .txt, .md, .docx, and .pdf files.
+ * @param filePath The path to the file on disk (the temporary file).
+ * @param originalFilename The original name of the file, used to determine the extension.
+ * @returns A promise that resolves with the extracted text content.
+ * @throws {UnsupportedFileTypeError} if the file extension is not supported.
+ */
+export async function extractTextFromFile(filePath: string, originalFilename: string): Promise<string> {
+    const extension = path.extname(originalFilename).toLowerCase();
+    const buffer = fs.readFileSync(filePath);
+
+    switch (extension) {
+        case '.docx':
+            // The styleMap is a good fallback, but our new Turndown rule is more robust for this case.
+            const options = {
+                styleMap: [
+                    "p[style-name='Heading 1'] => h1:fresh",
+                    "p[style-name='Heading 2'] => h2:fresh",
+                    "p[style-name='Heading 3'] => h3:fresh",
+                    "p[style-name='heading 1'] => h1:fresh",
+                    "p[style-name='heading 2'] => h2:fresh",
+                    "p[style-name='heading 3'] => h3:fresh",
+                ]
+            };
+            const htmlResult = await mammoth.convertToHtml({ buffer }, options);
+            // Use our customized turndown service to convert HTML to Markdown
+            return turndownService.turndown(htmlResult.value);
+
+        case '.pdf':
+            const data = await pdf(buffer);
+            return data.text.replace(/(\s*\n){3,}/g, '\n\n').trim();
+
+        case '.txt':
+        case '.md':
+        case '.json':
+        case '.ts':
+        case '.js':
+        case '.py':
+        case '.html':
+        case '.css':
+            return buffer.toString('utf-8');
+            
+        default:
+            throw new UnsupportedFileTypeError(`File type "${extension}" is not supported for document ingestion.`);
+    }
+}
+
 --- FILE: core/textChunker.ts ---
 
 // --- FILE: core/textChunker.ts ---
@@ -481,28 +576,31 @@ function chunkByHeadings(markdownContent: string): string[] {
     let currentChunk: any[] = [];
 
     tree.children.forEach(node => {
-        // A heading of level 1 or 2 always starts a new chunk.
-        if (node.type === 'heading' && (node.depth === 1 || node.depth === 2)) {
-            // If we have a pending chunk, push it to the main array.
+        // A heading of level 1, 2, or 3 now starts a new chunk for better granularity.
+        if (node.type === 'heading' && node.depth <= 3) {
             if (currentChunk.length > 0) {
                 chunks.push(toString({ type: 'root', children: currentChunk }));
             }
-            // Start a new chunk with the current heading.
             currentChunk = [node];
         } else {
-            // Otherwise, append the node to the current chunk.
             currentChunk.push(node);
         }
     });
 
-    // Add the last remaining chunk.
     if (currentChunk.length > 0) {
         chunks.push(toString({ type: 'root', children: currentChunk }));
     }
 
+    // --- NEW LOGGING: START ---
+    console.log(`[textChunker] Initial chunking pass found ${chunks.length} potential chunks based on headings.`);
+    // --- NEW LOGGING: END ---
+
     // If the document had no headings, the whole thing is one chunk.
     // In that case, we fall back to the paragraph chunker for better granularity.
     if (chunks.length === 1 && tree.children.some(node => node.type !== 'heading')) {
+        // --- NEW LOGGING: START ---
+        console.log('[textChunker] Only one heading-based chunk found. Falling back to paragraph-based chunking for better granularity.');
+        // --- NEW LOGGING: END ---
         return chunkByParagraphs(chunks[0]);
     }
     
@@ -966,15 +1064,13 @@ export default router;
 
 --- FILE: api/tasks/task.service.ts ---
 
-// --- FILE: api/tasks/task.service.ts ---
-
 // src/api/tasks/task.service.ts
-import { getDbClient } from '../../services/db';
+import pool from '../../services/db';
 import { getEmbedding } from '../../services/openai';
 import pgvector from 'pgvector/pg';
 
 export async function getTasks(projectId: number, status?: string) {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         let query = 'SELECT * FROM tasks WHERE project_id = $1';
         const params: any[] = [projectId];
@@ -986,14 +1082,12 @@ export async function getTasks(projectId: number, status?: string) {
         const { rows } = await client.query(query, params);
         return rows;
     } finally {
-        // Use client.release() if using a pool, or client.end() for single client
-        await client.end();
+        client.release();
     }
 }
 
-// MODIFIED: Accept description and include it in the embedding and insert
 export async function createTask(projectId: number, title: string, description?: string) {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         const contentToEmbed = `${title}${description ? `\n\n${description}` : ''}`;
         const titleEmbedding = await getEmbedding(contentToEmbed);
@@ -1007,11 +1101,10 @@ export async function createTask(projectId: number, title: string, description?:
         throw error;
     }
     finally {
-        await client.end();
+        client.release();
     }
 }
 
-// MODIFIED: Allow updating title, description, and status
 interface TaskUpdates {
     title?: string;
     description?: string;
@@ -1019,7 +1112,7 @@ interface TaskUpdates {
 }
 
 export async function updateTask(projectId: number, taskNumber: number, updates: TaskUpdates) {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         const { rows: existingTasks } = await client.query(
             'SELECT title, description FROM tasks WHERE project_id = $1 AND task_number = $2',
@@ -1054,7 +1147,6 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
             values.push(updates.description);
         }
 
-        // If title or description changed, re-calculate the embedding
         if (updates.title || updates.description) {
             const contentToEmbed = `${newTitle}${newDescription ? `\n\n${newDescription}` : ''}`;
             const newEmbedding = await getEmbedding(contentToEmbed);
@@ -1063,7 +1155,7 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
         }
 
         if (fieldsToUpdate.length === 0) {
-            return currentTask; // Nothing to update
+            return currentTask;
         }
 
         fieldsToUpdate.push(`updated_at = NOW()`);
@@ -1076,7 +1168,7 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
 
         return rows[0];
     } finally {
-        await client.end();
+        client.release();
     }
 }
 
@@ -1087,6 +1179,7 @@ import { Request, Response, NextFunction } from 'express';
 import * as projectService from './project.service';
 import * as qaService from './qa.service';
 import ingestionQueue from '../../services/queue.service';
+import { UnsupportedFileTypeError } from '../../core/documentExtractor'; // <-- IMPORT THE CUSTOM ERROR
 
 
 export async function listProjects(req: Request, res: Response, next: NextFunction) {
@@ -1218,6 +1311,45 @@ export async function uploadDocument(req: Request, res: Response, next: NextFunc
 
         res.status(201).json({ message: 'Document uploaded and indexed successfully.', document });
     } catch (error) {
+        // MODIFIED: Catch specific error for unsupported file types
+        if (error instanceof UnsupportedFileTypeError) {
+            return res.status(400).json({ error: error.message });
+        }
+        next(error);
+    }
+}
+
+// NEW: Controller to list all documents for a project
+export async function listDocuments(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const documents = await projectService.getProjectDocuments(projectId);
+        res.json(documents);
+    } catch (error) {
+        next(error);
+    }
+}
+
+// NEW: Controller to delete a document
+export async function deleteDocument(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const documentId = parseInt(req.params.documentId, 10);
+        await projectService.deleteProjectDocument(projectId, documentId);
+        res.status(204).send(); // 204 No Content is standard for successful deletions
+    } catch (error) {
+        next(error);
+    }
+}
+
+
+// NEW: Controller for project stats
+export async function getProjectStats(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const stats = await projectService.getProjectStats(projectId);
+        res.json(stats);
+    } catch (error) {
         next(error);
     }
 }
@@ -1239,8 +1371,18 @@ router.post('/', projectController.addProject);
 // MODIFIED: This is now a GET request to establish an SSE connection for logs
 router.get('/:projectId/sync-stream', projectController.streamIngestionLogs);
 
+// NEW: Route to get project statistics
+router.get('/:projectId/stats', projectController.getProjectStats);
+
 router.post('/:projectId/ask', projectController.askQuestion);
+
+// --- Document Routes ---
 router.post('/:projectId/documents', upload.single('document'), projectController.uploadDocument);
+// NEW: Route to list all documents for a project
+router.get('/:projectId/documents', projectController.listDocuments);
+// NEW: Route to delete a specific document
+router.delete('/:projectId/documents/:documentId', projectController.deleteDocument);
+
 
 // Mount task routes nested under projects
 router.use('/:projectId/tasks', taskRoutes);
@@ -1250,27 +1392,28 @@ export default router;
 --- FILE: api/projects/project.service.ts ---
 
 // src/api/projects/project.service.ts
-import { getDbClient } from '../../services/db';
+import pool from '../../services/db';
 import { cloneOrPullRepo } from '../../services/git';
-import { runIngestion, IngestionLogger } from '../../scripts/ingest'; // Import IngestionLogger
+import { runIngestion, IngestionLogger } from '../../scripts/ingest';
 import path from 'path';
 import { chunkText } from '../../core/textChunker';
 import { getEmbedding } from '../../services/openai';
 import fs from 'fs/promises';
 import pgvector from 'pgvector/pg';
+import { extractTextFromFile } from '../../core/documentExtractor';
 
 export async function getAllProjects() {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         const { rows } = await client.query('SELECT id, name, source FROM projects ORDER BY created_at DESC');
         return rows;
     } finally {
-        await client.end();
+        client.release();
     }
 }
 
 export async function getProjectById(projectId: number) {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         const { rows } = await client.query('SELECT * FROM projects WHERE id = $1', [projectId]);
         if (rows.length === 0) {
@@ -1278,17 +1421,16 @@ export async function getProjectById(projectId: number) {
         }
         return rows[0];
     } finally {
-        await client.end();
+        client.release();
     }
 }
 
 
 export async function createProject(source: string) {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         const existing = await client.query('SELECT * FROM projects WHERE source = $1', [source]);
         if (existing.rows.length > 0) {
-            // Project already exists, return it
             return { project: existing.rows[0], created: false };
         }
 
@@ -1299,14 +1441,13 @@ export async function createProject(source: string) {
         );
         return { project: rows[0], created: true };
     } finally {
-        await client.end();
+        client.release();
     }
 }
 
-// MODIFIED: This function now accepts a logger and is the core logic for ingestion.
 export async function startProjectIngestion(projectId: number, source: string, logger: IngestionLogger) {
     try {
-        const projectPath = await cloneOrPullRepo(source, logger); // Pass logger to git service
+        const projectPath = await cloneOrPullRepo(source, logger);
         logger(`[Project ${projectId}] Ingestion running...`);
         await runIngestion(projectId, projectPath, logger);
         logger(`✅ [Project ${projectId}] Ingestion complete.`);
@@ -1317,31 +1458,25 @@ export async function startProjectIngestion(projectId: number, source: string, l
     }
 }
 
-// NEW HELPER for fire-and-forget ingestion
 export function startProjectIngestionInBackground(projectId: number, source: string) {
-    // We don't await this, so it runs in the background.
-    // Logs will go to the console.
     startProjectIngestion(projectId, source, console.log);
 }
 
 export async function addProjectDocument(projectId: number, originalFilename: string, storedFilePath: string) {
-    const client = await getDbClient();
-    await client.query('BEGIN');
+    const client = await pool.connect();
     try {
-        // 1. Read the content of the uploaded file
-        const content = await fs.readFile(storedFilePath, 'utf-8');
-
-        // 2. Insert document metadata
+        await client.query('BEGIN');
+        
+        const content = await extractTextFromFile(storedFilePath, originalFilename);
+        
         const docResult = await client.query(
             'INSERT INTO project_documents (project_id, file_name, file_path) VALUES ($1, $2, $3) RETURNING id',
             [projectId, originalFilename, storedFilePath]
         );
         const documentId = docResult.rows[0].id;
-
-        // 3. Chunk the text content
+        
         const chunks = chunkText(content);
-
-        // 4. Embed and insert each chunk
+        
         for (const chunk of chunks) {
             const embedding = await getEmbedding(chunk);
             await client.query(
@@ -1349,33 +1484,141 @@ export async function addProjectDocument(projectId: number, originalFilename: st
                 [documentId, chunk, pgvector.toSql(embedding)]
             );
         }
-
+        
         await client.query('COMMIT');
-        return { id: documentId, file_name: originalFilename };
+        return { id: documentId, file_name: originalFilename, file_path: storedFilePath };
     } catch (error) {
         await client.query('ROLLBACK');
-        // Clean up the uploaded file on error
-        await fs.unlink(storedFilePath).catch(e => console.error("Failed to clean up file:", e));
+        console.error(`Failed to process document ${originalFilename}:`, error);
         throw error;
     } finally {
-        await client.end();
+        client.release();
+    }
+}
+
+export async function getProjectDocuments(projectId: number) {
+    const client = await pool.connect();
+    try {
+        const { rows } = await client.query(
+            'SELECT id, file_name, created_at FROM project_documents WHERE project_id = $1 ORDER BY created_at DESC',
+            [projectId]
+        );
+        return rows;
+    } finally {
+        client.release();
+    }
+}
+
+export async function deleteProjectDocument(projectId: number, documentId: number) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+        
+        const docResult = await client.query(
+            'SELECT file_path FROM project_documents WHERE id = $1 AND project_id = $2',
+            [documentId, projectId]
+        );
+
+        if (docResult.rows.length === 0) {
+            throw new Error('Document not found or does not belong to this project.');
+        }
+        const filePath = docResult.rows[0].file_path;
+        
+        await client.query('DELETE FROM document_chunks WHERE document_id = $1', [documentId]);
+        await client.query('DELETE FROM project_documents WHERE id = $1', [documentId]);
+        
+        await client.query('COMMIT');
+
+        if (filePath) {
+            try {
+                await fs.unlink(filePath);
+            } catch (fileError) {
+                console.error(`Failed to delete document file ${filePath}:`, fileError);
+            }
+        }
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(`Failed to delete document ${documentId}:`, error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+export async function getProjectStats(projectId: number) {
+    const client = await pool.connect();
+    try {
+        const [
+            fileStatsRes,
+            taskStatsRes,
+            docStatsRes,
+            commitHistoryRes,
+            contributorRes
+        ] = await Promise.all([
+            client.query(
+                `SELECT
+                    (SELECT COUNT(*) FROM indexed_files WHERE project_id = $1) as file_count,
+                    (SELECT COUNT(*) FROM code_chunks WHERE file_id IN (SELECT id FROM indexed_files WHERE project_id = $1)) as chunk_count`,
+                [projectId]
+            ),
+            client.query(
+                `SELECT status, COUNT(*) as count FROM tasks WHERE project_id = $1 GROUP BY status`,
+                [projectId]
+            ),
+            client.query(
+                `SELECT COUNT(*) as document_count FROM project_documents WHERE project_id = $1`,
+                [projectId]
+            ),
+            client.query(
+                `SELECT commit_hash, author_name, commit_date, message FROM commits WHERE project_id = $1 ORDER BY commit_date DESC LIMIT 50`,
+                [projectId]
+            ),
+            client.query(
+                `SELECT COUNT(DISTINCT author_name) as contributor_count FROM commits WHERE project_id = $1`,
+                [projectId]
+            )
+        ]);
+        
+        const taskStats = taskStatsRes.rows.reduce((acc, row) => {
+            acc[row.status] = parseInt(row.count, 10);
+            return acc;
+        }, { open: 0, in_progress: 0, done: 0 });
+
+        return {
+            files: {
+                count: parseInt(fileStatsRes.rows[0].file_count, 10),
+                chunks: parseInt(fileStatsRes.rows[0].chunk_count, 10),
+            },
+            tasks: taskStats,
+            documents: {
+                count: parseInt(docStatsRes.rows[0].document_count, 10),
+            },
+            git: {
+                commitCount: commitHistoryRes.rows.length,
+                contributorCount: parseInt(contributorRes.rows[0].contributor_count, 10),
+                history: commitHistoryRes.rows,
+            }
+        };
+    } finally {
+        client.release();
     }
 }
 
 --- FILE: api/projects/qa.service.ts ---
 
 // src/api/projects/qa.service.ts
-import { getDbClient } from '../../services/db';
+import pool from '../../services/db';
 import * as openAI from '../../services/openai';
 import pgvector from 'pgvector/pg';
+import { PoolClient } from 'pg';
 
 export async function getAnswerStream(projectId: number, question: string) {
-    const client = await getDbClient();
+    let client: PoolClient | null = null;
     try {
+        client = await pool.connect();
         const questionEmbedding = await openAI.getEmbedding(question);
         let contextString = '';
 
-        // --- Retrieve relevant tasks (no change) ---
         const { rows: relevantTasks } = await client.query(
             `SELECT task_number, title, status FROM tasks WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
             [projectId, pgvector.toSql(questionEmbedding)]
@@ -1384,7 +1627,6 @@ export async function getAnswerStream(projectId: number, question: string) {
             contextString += "Relevant Tasks:\n" + relevantTasks.map(t => `- Task #${t.task_number} [${t.status.toUpperCase()}]: ${t.title}`).join('\n') + '\n\n';
         }
 
-        // --- Retrieve relevant commits (no change) ---
         const { rows: relevantCommits } = await client.query(
             `SELECT commit_hash, message, author_name FROM commits WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
             [projectId, pgvector.toSql(questionEmbedding)]
@@ -1392,8 +1634,7 @@ export async function getAnswerStream(projectId: number, question: string) {
         if (relevantCommits.length > 0) {
             contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
         }
-
-        // --- MODIFIED: Retrieve relevant project documents with error handling ---
+        
         try {
             const { rows: relevantDocChunks } = await client.query(
                 `SELECT
@@ -1410,17 +1651,13 @@ export async function getAnswerStream(projectId: number, question: string) {
                 contextString += "Relevant Project Documents:\n" + relevantDocChunks.map(d => `--- FROM DOCUMENT: ${d.file_name} ---\n\n${d.content}`).join('\n\n') + '\n\n';
             }
         } catch (error: any) {
-            // If the table doesn't exist, this query will fail. We catch the error
-            // and log a warning instead of crashing the application.
-            if (error.code === '42P01') { // 42P01 is the PostgreSQL code for "undefined_table"
+            if (error.code === '42P01') {
                  console.warn('Warning: project_documents or document_chunks table not found. Skipping document search. Run migrations to enable this feature.');
             } else {
-                // For any other unexpected error, we still throw it.
                 throw error;
             }
         }
 
-        // --- Retrieve relevant files and code chunks (no change) ---
         const { rows: relevantFiles } = await client.query(
             `SELECT id, path FROM indexed_files WHERE project_id = $1 ORDER BY summary_embedding <=> $2 LIMIT 5`,
             [projectId, pgvector.toSql(questionEmbedding)]
@@ -1449,27 +1686,42 @@ export async function getAnswerStream(projectId: number, question: string) {
         const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include project documents, tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
         const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
         
+        // Release the client back to the pool before we return the stream
+        client.release();
+        client = null; // Prevent the finally block from releasing it again
+
         return openAI.getChatCompletionStream(systemPrompt, userPrompt);
 
     } finally {
-        await client.end();
+        // Ensure the client is always released if it exists
+        if (client) {
+            client.release();
+        }
     }
 }
 
 --- FILE: services/db.ts ---
 
 // src/services/db.ts
-import { Client } from 'pg';
+import { Pool } from 'pg';
 import pgvector from 'pgvector/pg';
 
 const connectionString = process.env.DATABASE_URL!;
 
-export async function getDbClient(): Promise<Client> {
-    const client = new Client({ connectionString });
-    await client.connect();
-    await pgvector.registerType(client);
-    return client;
+if (!connectionString) {
+    throw new Error("FATAL: Missing environment variable DATABASE_URL");
 }
+
+// Create a single, shared pool for the entire application
+const pool = new Pool({ connectionString });
+
+// Add a listener to register the vector type on each new connection
+// that the pool creates.
+pool.on('connect', async (client) => {
+    await pgvector.registerType(client);
+});
+
+export default pool;
 
 --- FILE: services/git.ts ---
 

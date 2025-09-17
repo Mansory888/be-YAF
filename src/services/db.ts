@@ -1,12 +1,20 @@
 // src/services/db.ts
-import { Client } from 'pg';
+import { Pool } from 'pg';
 import pgvector from 'pgvector/pg';
 
 const connectionString = process.env.DATABASE_URL!;
 
-export async function getDbClient(): Promise<Client> {
-    const client = new Client({ connectionString });
-    await client.connect();
-    await pgvector.registerType(client);
-    return client;
+if (!connectionString) {
+    throw new Error("FATAL: Missing environment variable DATABASE_URL");
 }
+
+// Create a single, shared pool for the entire application
+const pool = new Pool({ connectionString });
+
+// Add a listener to register the vector type on each new connection
+// that the pool creates.
+pool.on('connect', async (client) => {
+    await pgvector.registerType(client);
+});
+
+export default pool;

@@ -1,12 +1,10 @@
-// --- FILE: api/tasks/task.service.ts ---
-
 // src/api/tasks/task.service.ts
-import { getDbClient } from '../../services/db';
+import pool from '../../services/db';
 import { getEmbedding } from '../../services/openai';
 import pgvector from 'pgvector/pg';
 
 export async function getTasks(projectId: number, status?: string) {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         let query = 'SELECT * FROM tasks WHERE project_id = $1';
         const params: any[] = [projectId];
@@ -18,14 +16,12 @@ export async function getTasks(projectId: number, status?: string) {
         const { rows } = await client.query(query, params);
         return rows;
     } finally {
-        // Use client.release() if using a pool, or client.end() for single client
-        await client.end();
+        client.release();
     }
 }
 
-// MODIFIED: Accept description and include it in the embedding and insert
 export async function createTask(projectId: number, title: string, description?: string) {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         const contentToEmbed = `${title}${description ? `\n\n${description}` : ''}`;
         const titleEmbedding = await getEmbedding(contentToEmbed);
@@ -39,11 +35,10 @@ export async function createTask(projectId: number, title: string, description?:
         throw error;
     }
     finally {
-        await client.end();
+        client.release();
     }
 }
 
-// MODIFIED: Allow updating title, description, and status
 interface TaskUpdates {
     title?: string;
     description?: string;
@@ -51,7 +46,7 @@ interface TaskUpdates {
 }
 
 export async function updateTask(projectId: number, taskNumber: number, updates: TaskUpdates) {
-    const client = await getDbClient();
+    const client = await pool.connect();
     try {
         const { rows: existingTasks } = await client.query(
             'SELECT title, description FROM tasks WHERE project_id = $1 AND task_number = $2',
@@ -86,7 +81,6 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
             values.push(updates.description);
         }
 
-        // If title or description changed, re-calculate the embedding
         if (updates.title || updates.description) {
             const contentToEmbed = `${newTitle}${newDescription ? `\n\n${newDescription}` : ''}`;
             const newEmbedding = await getEmbedding(contentToEmbed);
@@ -95,7 +89,7 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
         }
 
         if (fieldsToUpdate.length === 0) {
-            return currentTask; // Nothing to update
+            return currentTask;
         }
 
         fieldsToUpdate.push(`updated_at = NOW()`);
@@ -108,6 +102,6 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
 
         return rows[0];
     } finally {
-        await client.end();
+        client.release();
     }
 }

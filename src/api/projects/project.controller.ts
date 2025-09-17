@@ -143,6 +143,30 @@ export async function uploadDocument(req: Request, res: Response, next: NextFunc
     }
 }
 
+// NEW: Controller to list all documents for a project
+export async function listDocuments(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const documents = await projectService.getProjectDocuments(projectId);
+        res.json(documents);
+    } catch (error) {
+        next(error);
+    }
+}
+
+// NEW: Controller to delete a document
+export async function deleteDocument(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const documentId = parseInt(req.params.documentId, 10);
+        await projectService.deleteProjectDocument(projectId, documentId);
+        res.status(204).send(); // 204 No Content is standard for successful deletions
+    } catch (error) {
+        next(error);
+    }
+}
+
+
 // NEW: Controller for project stats
 export async function getProjectStats(req: Request, res: Response, next: NextFunction) {
     try {
