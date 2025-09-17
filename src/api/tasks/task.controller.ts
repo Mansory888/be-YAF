@@ -46,3 +46,17 @@ export async function updateTask(req: Request, res: Response, next: NextFunction
         next(error);
     }
 }
+
+export async function deleteTask(req: Request, res: Response, next: NextFunction) {
+    try {
+        const { projectId, taskNumber } = req.params;
+        await taskService.deleteTask(
+            parseInt(projectId, 10),
+            parseInt(taskNumber, 10)
+        );
+        // 204 No Content is the standard successful response for a DELETE request
+        res.status(204).send();
+    } catch (error) {
+        next(error);
+    }
+}

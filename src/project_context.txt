@@ -1466,26 +1466,54 @@ export async function addProjectDocument(projectId: number, originalFilename: st
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        
+
         const content = await extractTextFromFile(storedFilePath, originalFilename);
-        
+
         const docResult = await client.query(
             'INSERT INTO project_documents (project_id, file_name, file_path) VALUES ($1, $2, $3) RETURNING id',
             [projectId, originalFilename, storedFilePath]
         );
         const documentId = docResult.rows[0].id;
-        
+
         const chunks = chunkText(content);
-        
+
+        console.log(`[project.service] Number of chunks to be inserted: ${chunks.length}`);
+        let chunkCounter = 0;
+
         for (const chunk of chunks) {
-            const embedding = await getEmbedding(chunk);
-            await client.query(
-                'INSERT INTO document_chunks (document_id, content, embedding) VALUES ($1, $2, $3)',
-                [documentId, chunk, pgvector.toSql(embedding)]
-            );
+            chunkCounter++;
+            console.log(`[project.service] >> Processing chunk ${chunkCounter}/${chunks.length}`);
+
+            // Let's inspect the chunk to make sure it's valid
+            if (!chunk || chunk.trim().length < 5) {
+                console.log(`[project.service] >> Chunk ${chunkCounter} is too short or empty. Skipping.`);
+                continue;
+            }
+
+            try {
+                console.log(`[project.service] >>   1. Generating embedding for chunk ${chunkCounter}...`);
+                const embedding = await getEmbedding(chunk);
+                console.log(`[project.service] >>   2. Embedding generated (length: ${embedding.length}). Inserting into DB...`);
+
+                await client.query(
+                    'INSERT INTO document_chunks (document_id, content, embedding) VALUES ($1, $2, $3)',
+                    [documentId, chunk, pgvector.toSql(embedding)]
+                );
+
+                console.log(`[project.service] >>   3. Successfully inserted chunk ${chunkCounter} into DB.`);
+
+            } catch (loopError) {
+                // THIS IS A NEW, CRITICAL CATCH BLOCK
+                console.error(`[project.service] >> !! ERROR inside chunk loop on chunk ${chunkCounter}:`, loopError);
+                // We re-throw the error to ensure the main transaction is rolled back.
+                throw loopError;
+            }
         }
-        
+
+        console.log(`[project.service] Finished processing all chunks. Committing transaction...`);
+
         await client.query('COMMIT');
+        console.log('[project.service] Transaction committed.'); // Let's confirm this happens
         return { id: documentId, file_name: originalFilename, file_path: storedFilePath };
     } catch (error) {
         await client.query('ROLLBACK');
@@ -1513,7 +1541,7 @@ export async function deleteProjectDocument(projectId: number, documentId: numbe
     const client = await pool.connect();
     try {
         await client.query('BEGIN');
-        
+
         const docResult = await client.query(
             'SELECT file_path FROM project_documents WHERE id = $1 AND project_id = $2',
             [documentId, projectId]
@@ -1523,10 +1551,10 @@ export async function deleteProjectDocument(projectId: number, documentId: numbe
             throw new Error('Document not found or does not belong to this project.');
         }
         const filePath = docResult.rows[0].file_path;
-        
+
         await client.query('DELETE FROM document_chunks WHERE document_id = $1', [documentId]);
         await client.query('DELETE FROM project_documents WHERE id = $1', [documentId]);
-        
+
         await client.query('COMMIT');
 
         if (filePath) {
@@ -1578,7 +1606,7 @@ export async function getProjectStats(projectId: number) {
                 [projectId]
             )
         ]);
-        
+
         const taskStats = taskStatsRes.rows.reduce((acc, row) => {
             acc[row.status] = parseInt(row.count, 10);
             return acc;

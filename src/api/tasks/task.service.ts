@@ -105,3 +105,19 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
         client.release();
     }
 }
+
+export async function deleteTask(projectId: number, taskNumber: number): Promise<void> {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            'DELETE FROM tasks WHERE project_id = $1 AND task_number = $2',
+            [projectId, taskNumber]
+        );
+
+        if (result.rowCount === 0) {
+            throw new Error('Task not found or does not belong to this project.');
+        }
+    } finally {
+        client.release();
+    }
+}

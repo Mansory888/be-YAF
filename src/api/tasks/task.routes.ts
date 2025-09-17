@@ -7,5 +7,6 @@ const router = Router({ mergeParams: true }); // mergeParams is crucial for nest
 router.get('/', taskController.listTasks);
 router.post('/', taskController.createTask); 
 router.put('/:taskNumber', taskController.updateTask); 
+router.delete('/:taskNumber', taskController.deleteTask);
 
 export default router;
