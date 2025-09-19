@@ -2,6 +2,7 @@
 import { Router } from 'express';
 import * as projectController from './project.controller';
 import taskRoutes from '../tasks/task.routes';
+import conversationRoutes from '../conversations/conversation.routes'; // <-- IMPORT NEW ROUTES
 import multer from 'multer';
 
 const router = Router();
@@ -16,7 +17,8 @@ router.get('/:projectId/sync-stream', projectController.streamIngestionLogs);
 // NEW: Route to get project statistics
 router.get('/:projectId/stats', projectController.getProjectStats);
 
-router.post('/:projectId/ask', projectController.askQuestion);
+// REMOVED: The old 'ask' route is gone.
+// router.post('/:projectId/ask', projectController.askQuestion);
 
 // --- Document Routes ---
 router.post('/:projectId/documents', upload.single('document'), projectController.uploadDocument);
@@ -28,5 +30,8 @@ router.delete('/:projectId/documents/:documentId', projectController.deleteDocum
 
 // Mount task routes nested under projects
 router.use('/:projectId/tasks', taskRoutes);
+
+// NEW: Mount conversation routes nested under projects
+router.use('/:projectId/conversations', conversationRoutes);
 
 export default router;

@@ -1048,6 +1048,20 @@ export async function updateTask(req: Request, res: Response, next: NextFunction
     }
 }
 
+export async function deleteTask(req: Request, res: Response, next: NextFunction) {
+    try {
+        const { projectId, taskNumber } = req.params;
+        await taskService.deleteTask(
+            parseInt(projectId, 10),
+            parseInt(taskNumber, 10)
+        );
+        // 204 No Content is the standard successful response for a DELETE request
+        res.status(204).send();
+    } catch (error) {
+        next(error);
+    }
+}
+
 --- FILE: api/tasks/task.routes.ts ---
 
 // src/api/tasks/task.routes.ts
@@ -1059,6 +1073,7 @@ const router = Router({ mergeParams: true }); // mergeParams is crucial for nest
 router.get('/', taskController.listTasks);
 router.post('/', taskController.createTask); 
 router.put('/:taskNumber', taskController.updateTask); 
+router.delete('/:taskNumber', taskController.deleteTask);
 
 export default router;
 
@@ -1172,6 +1187,22 @@ export async function updateTask(projectId: number, taskNumber: number, updates:
     }
 }
 
+export async function deleteTask(projectId: number, taskNumber: number): Promise<void> {
+    const client = await pool.connect();
+    try {
+        const result = await client.query(
+            'DELETE FROM tasks WHERE project_id = $1 AND task_number = $2',
+            [projectId, taskNumber]
+        );
+
+        if (result.rowCount === 0) {
+            throw new Error('Task not found or does not belong to this project.');
+        }
+    } finally {
+        client.release();
+    }
+}
+
 --- FILE: api/projects/project.controller.ts ---
 
 // src/api/projects/project.controller.ts
@@ -1179,7 +1210,7 @@ import { Request, Response, NextFunction } from 'express';
 import * as projectService from './project.service';
 import * as qaService from './qa.service';
 import ingestionQueue from '../../services/queue.service';
-import { UnsupportedFileTypeError } from '../../core/documentExtractor'; // <-- IMPORT THE CUSTOM ERROR
+import { UnsupportedFileTypeError } from '../../core/documentExtractor';
 
 
 export async function listProjects(req: Request, res: Response, next: NextFunction) {
@@ -1270,28 +1301,68 @@ export async function streamIngestionLogs(req: Request, res: Response, next: Nex
 }
 
 
+// MODIFIED: This controller now uses Server-Sent Events (SSE)
 export async function askQuestion(req: Request, res: Response, next: NextFunction) {
     try {
         const projectId = parseInt(req.params.projectId, 10);
         const { question } = req.body;
+
         if (!question) {
             return res.status(400).json({ error: 'A "question" is required.' });
         }
-        
-        const stream = await qaService.getAnswerStream(projectId, question);
-        
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        for await (const chunk of stream) {
-            res.write(chunk.choices[0]?.delta?.content || '');
-        }
-        res.end();
+
+        // Setup SSE headers
+        res.setHeader('Content-Type', 'text/event-stream');
+        res.setHeader('Cache-Control', 'no-cache');
+        res.setHeader('Connection', 'keep-alive');
+        res.flushHeaders();
+
+        // Handle client disconnect
+        req.on('close', () => {
+            console.log(`Client disconnected from question stream for project ${projectId}.`);
+            res.end();
+        });
+
+        // Self-contained logic for streaming with error handling
+        try {
+            const { stream, sources } = await qaService.getAnswerStream(projectId, question);
+            
+            // 1. Send the sources first
+            res.write(`event: sources\ndata: ${JSON.stringify(sources)}\n\n`);
+
+            // 2. Stream the AI response tokens
+            for await (const chunk of stream) {
+                if (res.writableEnded) break; // Stop if client has disconnected
+                const content = chunk.choices[0]?.delta?.content || '';
+                if (content) {
+                    res.write(`event: token\ndata: ${JSON.stringify({ token: content })}\n\n`);
+                }
+            }
+
+            // 3. Signal that the stream has finished AND end the response
+            if (!res.writableEnded) {
+                res.write(`event: end\ndata: ${JSON.stringify({ message: "Stream finished" })}\n\n`);
+                res.end(); // <-- FIX: End the stream here
+            }
+        } catch (streamError) {
+            const errorMessage = streamError instanceof Error ? streamError.message : "An unknown error occurred during streaming.";
+            console.error("Error during Q&A stream:", streamError);
+            if (!res.writableEnded) {
+                res.write(`event: error\ndata: ${JSON.stringify({ message: errorMessage })}\n\n`);
+                res.end(); // <-- FIX: End the stream here
+            }
+        } 
+        // --- FIX: The `finally` block has been removed ---
 
     } catch (error) {
+        // This outer catch handles errors before the stream starts (e.g., bad request parsing)
         if (!res.headersSent) {
           next(error);
         } else {
-          console.error("Error during streaming:", error);
-          res.end();
+          console.error("Error after headers sent but before stream started:", error);
+          if (!res.writableEnded) {
+            res.end();
+          }
         }
     }
 }
@@ -1639,13 +1710,22 @@ import pool from '../../services/db';
 import * as openAI from '../../services/openai';
 import pgvector from 'pgvector/pg';
 import { PoolClient } from 'pg';
+import OpenAI from 'openai';
 
-export async function getAnswerStream(projectId: number, question: string) {
+// NEW: Define a type for the sources we collect.
+export interface Source {
+    type: 'task' | 'commit' | 'document' | 'code';
+    id: string | number;
+    title: string;
+}
+
+export async function getAnswerStream(projectId: number, question: string): Promise<{ stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>, sources: Source[] }> {
     let client: PoolClient | null = null;
     try {
         client = await pool.connect();
         const questionEmbedding = await openAI.getEmbedding(question);
         let contextString = '';
+        const sources: Source[] = []; // NEW: Initialize sources array
 
         const { rows: relevantTasks } = await client.query(
             `SELECT task_number, title, status FROM tasks WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
@@ -1653,6 +1733,12 @@ export async function getAnswerStream(projectId: number, question: string) {
         );
         if (relevantTasks.length > 0) {
             contextString += "Relevant Tasks:\n" + relevantTasks.map(t => `- Task #${t.task_number} [${t.status.toUpperCase()}]: ${t.title}`).join('\n') + '\n\n';
+            // NEW: Add tasks to sources
+            relevantTasks.forEach(t => sources.push({
+                type: 'task',
+                id: t.task_number,
+                title: `#${t.task_number}: ${t.title}`
+            }));
         }
 
         const { rows: relevantCommits } = await client.query(
@@ -1661,6 +1747,12 @@ export async function getAnswerStream(projectId: number, question: string) {
         );
         if (relevantCommits.length > 0) {
             contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
+            // NEW: Add commits to sources
+            relevantCommits.forEach(c => sources.push({
+                type: 'commit',
+                id: c.commit_hash.substring(0, 7),
+                title: `${c.commit_hash.substring(0, 7)}: ${c.message.split('\n')[0]}`
+            }));
         }
         
         try {
@@ -1677,6 +1769,13 @@ export async function getAnswerStream(projectId: number, question: string) {
             );
             if (relevantDocChunks.length > 0) {
                 contextString += "Relevant Project Documents:\n" + relevantDocChunks.map(d => `--- FROM DOCUMENT: ${d.file_name} ---\n\n${d.content}`).join('\n\n') + '\n\n';
+                // NEW: Add unique documents to sources
+                const uniqueDocs = [...new Map(relevantDocChunks.map(d => [d.file_name, d])).values()];
+                uniqueDocs.forEach(d => sources.push({
+                    type: 'document',
+                    id: d.file_name,
+                    title: d.file_name
+                }));
             }
         } catch (error: any) {
             if (error.code === '42P01') {
@@ -1704,6 +1803,17 @@ export async function getAnswerStream(projectId: number, question: string) {
                     return `--- FILE: ${filePath} (Chunk: ${c.chunk_name}) ---\n\n${c.content}`;
                 }).join('\n\n');
                 contextString += "Relevant Code Snippets:\n" + chunkContext;
+                
+                // NEW: Add unique file paths to sources
+                const uniqueFilePaths = new Set(contextChunks.map(c => {
+                    return relevantFiles.find(f => f.id === c.file_id)?.path;
+                }).filter((p): p is string => !!p));
+
+                uniqueFilePaths.forEach(filePath => sources.push({
+                    type: 'code',
+                    id: filePath,
+                    title: filePath
+                }));
             }
         }
         
@@ -1714,14 +1824,15 @@ export async function getAnswerStream(projectId: number, question: string) {
         const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include project documents, tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
         const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
         
-        // Release the client back to the pool before we return the stream
         client.release();
-        client = null; // Prevent the finally block from releasing it again
+        client = null;
 
-        return openAI.getChatCompletionStream(systemPrompt, userPrompt);
+        const stream = await openAI.getChatCompletionStream(systemPrompt, userPrompt);
+        
+        // MODIFIED: Return both stream and sources
+        return { stream, sources };
 
     } finally {
-        // Ensure the client is always released if it exists
         if (client) {
             client.release();
         }

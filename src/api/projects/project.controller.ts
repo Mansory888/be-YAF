@@ -3,7 +3,7 @@ import { Request, Response, NextFunction } from 'express';
 import * as projectService from './project.service';
 import * as qaService from './qa.service';
 import ingestionQueue from '../../services/queue.service';
-import { UnsupportedFileTypeError } from '../../core/documentExtractor'; // <-- IMPORT THE CUSTOM ERROR
+import { UnsupportedFileTypeError } from '../../core/documentExtractor';
 
 
 export async function listProjects(req: Request, res: Response, next: NextFunction) {
@@ -94,31 +94,9 @@ export async function streamIngestionLogs(req: Request, res: Response, next: Nex
 }
 
 
-export async function askQuestion(req: Request, res: Response, next: NextFunction) {
-    try {
-        const projectId = parseInt(req.params.projectId, 10);
-        const { question } = req.body;
-        if (!question) {
-            return res.status(400).json({ error: 'A "question" is required.' });
-        }
-        
-        const stream = await qaService.getAnswerStream(projectId, question);
-        
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        for await (const chunk of stream) {
-            res.write(chunk.choices[0]?.delta?.content || '');
-        }
-        res.end();
+// REMOVED: The `askQuestion` controller has been deleted from this file.
+// Its functionality is now handled by the new conversation controller.
 
-    } catch (error) {
-        if (!res.headersSent) {
-          next(error);
-        } else {
-          console.error("Error during streaming:", error);
-          res.end();
-        }
-    }
-}
 
 export async function uploadDocument(req: Request, res: Response, next: NextFunction) {
     try {

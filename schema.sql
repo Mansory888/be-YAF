@@ -114,3 +114,40 @@ CREATE INDEX idx_document_chunks_embedding ON document_chunks USING HNSW (embedd
 
 -- B-tree index for faster joins.
 CREATE INDEX IF NOT EXISTS idx_project_documents_project_id ON project_documents (project_id);
+
+
+CREATE TABLE conversations (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    title VARCHAR(255) NOT NULL,
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE conversation_messages (
+    id SERIAL PRIMARY KEY,
+    conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role VARCHAR(10) NOT NULL CHECK (role IN ('user', 'assistant')), -- 'user' or 'assistant'
+    content TEXT NOT NULL,
+    sources JSONB, -- Storing the sources for the assistant's message
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+
+CREATE TABLE knowledge_notes (
+    id SERIAL PRIMARY KEY,
+    project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    conversation_id INTEGER REFERENCES conversations(id) ON DELETE SET NULL, -- Optional link
+    note_summary TEXT NOT NULL, -- e.g., "Decision: Change JWT expiration from 1h to 24h"
+    embedding VECTOR(1536), -- The vector representation of the summary
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE TABLE knowledge_note_links (
+    id SERIAL PRIMARY KEY,
+    knowledge_note_id INTEGER NOT NULL REFERENCES knowledge_notes(id) ON DELETE CASCADE,
+    file_id INTEGER REFERENCES indexed_files(id) ON DELETE CASCADE,
+    task_id INTEGER REFERENCES tasks(id) ON DELETE CASCADE,
+    commit_id INTEGER REFERENCES commits(id) ON DELETE CASCADE
+    -- Note: We can use constraints to ensure at least one link is not null
+);
