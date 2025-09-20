@@ -27,6 +27,10 @@ Project file structure:
             project.routes.ts
             project.service.ts
             qa.service.ts
+        conversations/
+            conversation.controller.ts
+            conversation.routes.ts
+            conversation.service.ts
     services/
         db.ts
         git.ts
@@ -1301,71 +1305,9 @@ export async function streamIngestionLogs(req: Request, res: Response, next: Nex
 }
 
 
-// MODIFIED: This controller now uses Server-Sent Events (SSE)
-export async function askQuestion(req: Request, res: Response, next: NextFunction) {
-    try {
-        const projectId = parseInt(req.params.projectId, 10);
-        const { question } = req.body;
+// REMOVED: The `askQuestion` controller has been deleted from this file.
+// Its functionality is now handled by the new conversation controller.
 
-        if (!question) {
-            return res.status(400).json({ error: 'A "question" is required.' });
-        }
-
-        // Setup SSE headers
-        res.setHeader('Content-Type', 'text/event-stream');
-        res.setHeader('Cache-Control', 'no-cache');
-        res.setHeader('Connection', 'keep-alive');
-        res.flushHeaders();
-
-        // Handle client disconnect
-        req.on('close', () => {
-            console.log(`Client disconnected from question stream for project ${projectId}.`);
-            res.end();
-        });
-
-        // Self-contained logic for streaming with error handling
-        try {
-            const { stream, sources } = await qaService.getAnswerStream(projectId, question);
-            
-            // 1. Send the sources first
-            res.write(`event: sources\ndata: ${JSON.stringify(sources)}\n\n`);
-
-            // 2. Stream the AI response tokens
-            for await (const chunk of stream) {
-                if (res.writableEnded) break; // Stop if client has disconnected
-                const content = chunk.choices[0]?.delta?.content || '';
-                if (content) {
-                    res.write(`event: token\ndata: ${JSON.stringify({ token: content })}\n\n`);
-                }
-            }
-
-            // 3. Signal that the stream has finished AND end the response
-            if (!res.writableEnded) {
-                res.write(`event: end\ndata: ${JSON.stringify({ message: "Stream finished" })}\n\n`);
-                res.end(); // <-- FIX: End the stream here
-            }
-        } catch (streamError) {
-            const errorMessage = streamError instanceof Error ? streamError.message : "An unknown error occurred during streaming.";
-            console.error("Error during Q&A stream:", streamError);
-            if (!res.writableEnded) {
-                res.write(`event: error\ndata: ${JSON.stringify({ message: errorMessage })}\n\n`);
-                res.end(); // <-- FIX: End the stream here
-            }
-        } 
-        // --- FIX: The `finally` block has been removed ---
-
-    } catch (error) {
-        // This outer catch handles errors before the stream starts (e.g., bad request parsing)
-        if (!res.headersSent) {
-          next(error);
-        } else {
-          console.error("Error after headers sent but before stream started:", error);
-          if (!res.writableEnded) {
-            res.end();
-          }
-        }
-    }
-}
 
 export async function uploadDocument(req: Request, res: Response, next: NextFunction) {
     try {
@@ -1431,6 +1373,7 @@ export async function getProjectStats(req: Request, res: Response, next: NextFun
 import { Router } from 'express';
 import * as projectController from './project.controller';
 import taskRoutes from '../tasks/task.routes';
+import conversationRoutes from '../conversations/conversation.routes'; // <-- IMPORT NEW ROUTES
 import multer from 'multer';
 
 const router = Router();
@@ -1445,7 +1388,8 @@ router.get('/:projectId/sync-stream', projectController.streamIngestionLogs);
 // NEW: Route to get project statistics
 router.get('/:projectId/stats', projectController.getProjectStats);
 
-router.post('/:projectId/ask', projectController.askQuestion);
+// REMOVED: The old 'ask' route is gone.
+// router.post('/:projectId/ask', projectController.askQuestion);
 
 // --- Document Routes ---
 router.post('/:projectId/documents', upload.single('document'), projectController.uploadDocument);
@@ -1457,6 +1401,9 @@ router.delete('/:projectId/documents/:documentId', projectController.deleteDocum
 
 // Mount task routes nested under projects
 router.use('/:projectId/tasks', taskRoutes);
+
+// NEW: Mount conversation routes nested under projects
+router.use('/:projectId/conversations', conversationRoutes);
 
 export default router;
 
@@ -1714,26 +1661,60 @@ import OpenAI from 'openai';
 
 // NEW: Define a type for the sources we collect.
 export interface Source {
-    type: 'task' | 'commit' | 'document' | 'code';
+    type: 'task' | 'commit' | 'document' | 'code' | 'knowledge'; // <-- Added 'knowledge'
     id: string | number;
     title: string;
 }
 
-export async function getAnswerStream(projectId: number, question: string): Promise<{ stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>, sources: Source[] }> {
+// NEW: Define a type for message history, matching the one in openai.ts
+export interface ChatMessage {
+    role: 'user' | 'assistant';
+    content: string;
+}
+
+
+// MODIFIED: The function signature is completely new.
+export async function getAnswerStream(
+    projectId: number, 
+    latestQuestion: string, 
+    history: ChatMessage[]
+): Promise<{ stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>, sources: Source[] }> {
     let client: PoolClient | null = null;
     try {
         client = await pool.connect();
-        const questionEmbedding = await openAI.getEmbedding(question);
+        const questionEmbedding = await openAI.getEmbedding(latestQuestion);
         let contextString = '';
-        const sources: Source[] = []; // NEW: Initialize sources array
+        const sources: Source[] = [];
 
+        // --- NEW: Search for relevant knowledge notes (past decisions) ---
+        try {
+            const { rows: relevantNotes } = await client.query(
+                `SELECT id, note_summary FROM knowledge_notes WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 2`,
+                [projectId, pgvector.toSql(questionEmbedding)]
+            );
+            if (relevantNotes.length > 0) {
+                contextString += "Relevant Past Decisions/Summaries:\n" + relevantNotes.map(n => `- ${n.note_summary}`).join('\n') + '\n\n';
+                relevantNotes.forEach(n => sources.push({
+                    type: 'knowledge',
+                    id: n.id,
+                    title: n.note_summary
+                }));
+            }
+        } catch (error: any) {
+             if (error.code === '42P01') {
+                 console.warn('Warning: knowledge_notes table not found. Skipping knowledge search. Run migrations to enable this feature.');
+            } else {
+                throw error;
+            }
+        }
+
+        // --- Existing context retrieval (unchanged logic) ---
         const { rows: relevantTasks } = await client.query(
             `SELECT task_number, title, status FROM tasks WHERE project_id = $1 ORDER BY embedding <=> $2 LIMIT 3`,
             [projectId, pgvector.toSql(questionEmbedding)]
         );
         if (relevantTasks.length > 0) {
             contextString += "Relevant Tasks:\n" + relevantTasks.map(t => `- Task #${t.task_number} [${t.status.toUpperCase()}]: ${t.title}`).join('\n') + '\n\n';
-            // NEW: Add tasks to sources
             relevantTasks.forEach(t => sources.push({
                 type: 'task',
                 id: t.task_number,
@@ -1747,7 +1728,6 @@ export async function getAnswerStream(projectId: number, question: string): Prom
         );
         if (relevantCommits.length > 0) {
             contextString += "Relevant Commits:\n" + relevantCommits.map(c => `- Commit ${c.commit_hash.substring(0, 7)} by ${c.author_name}: ${c.message.split('\n')[0]}`).join('\n') + '\n\n';
-            // NEW: Add commits to sources
             relevantCommits.forEach(c => sources.push({
                 type: 'commit',
                 id: c.commit_hash.substring(0, 7),
@@ -1769,7 +1749,6 @@ export async function getAnswerStream(projectId: number, question: string): Prom
             );
             if (relevantDocChunks.length > 0) {
                 contextString += "Relevant Project Documents:\n" + relevantDocChunks.map(d => `--- FROM DOCUMENT: ${d.file_name} ---\n\n${d.content}`).join('\n\n') + '\n\n';
-                // NEW: Add unique documents to sources
                 const uniqueDocs = [...new Map(relevantDocChunks.map(d => [d.file_name, d])).values()];
                 uniqueDocs.forEach(d => sources.push({
                     type: 'document',
@@ -1804,7 +1783,6 @@ export async function getAnswerStream(projectId: number, question: string): Prom
                 }).join('\n\n');
                 contextString += "Relevant Code Snippets:\n" + chunkContext;
                 
-                // NEW: Add unique file paths to sources
                 const uniqueFilePaths = new Set(contextChunks.map(c => {
                     return relevantFiles.find(f => f.id === c.file_id)?.path;
                 }).filter((p): p is string => !!p));
@@ -1817,25 +1795,418 @@ export async function getAnswerStream(projectId: number, question: string): Prom
             }
         }
         
-        if (!contextString.trim()) {
-            throw new Error("No relevant context found for this question (no tasks, commits, or code).");
+        if (!contextString.trim() && history.length === 0) {
+            throw new Error("No relevant context found for this question (no tasks, commits, code, or existing conversation).");
         }
-
-        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context, which may include project documents, tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context is insufficient, state that clearly.`;
-        const userPrompt = `CONTEXT:\n${contextString}\n\nQUESTION:\n${question}`;
         
         client.release();
         client = null;
 
-        const stream = await openAI.getChatCompletionStream(systemPrompt, userPrompt);
+        // --- NEW: Prompt construction with history ---
+        const systemPrompt = `You are an expert AI software engineer. Answer the user's question based ONLY on the provided context and conversation history. Context may include past decisions, project documents, tasks, commits, and code snippets. Be concise, accurate, and provide code snippets in Markdown format when relevant. If the context and history are insufficient, state that clearly.`;
+
+        const userMessageWithContext = `CONTEXT:\n${contextString}\n\nQUESTION:\n${latestQuestion}`;
+
+        // Construct the full message payload for the OpenAI API
+        const messages: openAI.ChatMessage[] = [
+            { role: 'system', content: systemPrompt },
+            ...history,
+            { role: 'user', content: userMessageWithContext }
+        ];
+
+        const stream = await openAI.getChatCompletionStream(messages);
         
-        // MODIFIED: Return both stream and sources
         return { stream, sources };
 
     } finally {
         if (client) {
             client.release();
         }
+    }
+}
+
+--- FILE: api/conversations/conversation.controller.ts ---
+
+// --- FILE: api/conversations/conversation.controller.ts ---
+import { Request, Response, NextFunction } from 'express';
+import * as conversationService from './conversation.service';
+import * as qaService from '../projects/qa.service'; 
+
+// streamResponse function (unchanged)
+async function streamResponse(req: Request, res: Response, conversationId: number, projectId: number) {
+    // ... (previous code)
+    // Setup SSE headers
+    res.setHeader('Content-Type', 'text/event-stream');
+    res.setHeader('Cache-Control', 'no-cache');
+    res.setHeader('Connection', 'keep-alive');
+    res.flushHeaders();
+
+    let fullResponse = '';
+    
+    req.on('close', () => {
+        console.log(`Client disconnected from conversation stream ${conversationId}.`);
+        res.end();
+    });
+
+    try {
+        const messages = await conversationService.getConversationMessages(conversationId);
+
+        if (messages.length === 0) {
+            throw new Error('Cannot stream response for an empty conversation.');
+        }
+
+        // The last message is the current question from the user
+        const lastMessage = messages[messages.length - 1];
+        const question = lastMessage.content;
+
+        // The preceding messages form the history
+        const history: qaService.ChatMessage[] = messages.slice(0, -1).map(m => ({
+            role: m.role as ('user' | 'assistant'),
+            content: m.content
+        }));
+
+        const { stream, sources } = await qaService.getAnswerStream(
+            projectId,
+            question,
+            history // <-- Pass the history here
+        );
+        
+        res.write(`event: sources\ndata: ${JSON.stringify(sources)}\n\n`);
+
+        for await (const chunk of stream) {
+            if (res.writableEnded) break;
+            const content = chunk.choices[0]?.delta?.content || '';
+            if (content) {
+                fullResponse += content;
+                res.write(`event: token\ndata: ${JSON.stringify({ token: content })}\n\n`);
+            }
+        }
+
+        await conversationService.addAssistantMessage(conversationId, fullResponse, sources);
+
+        if (!res.writableEnded) {
+            res.write(`event: end\ndata: ${JSON.stringify({ message: "Stream finished" })}\n\n`);
+            res.end();
+        }
+    } catch (streamError) {
+        const errorMessage = streamError instanceof Error ? streamError.message : "An unknown error occurred during streaming.";
+        console.error("Error during Q&A stream:", streamError);
+        if (!res.writableEnded) {
+            res.write(`event: error\ndata: ${JSON.stringify({ message: errorMessage })}\n\n`);
+            res.end();
+        }
+    }
+}
+
+
+// createConversation function (unchanged)
+export async function createConversation(req: Request, res: Response, next: NextFunction) {
+    // ... (previous code)
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const { first_message } = req.body;
+
+        if (!first_message) {
+            return res.status(400).json({ error: 'A "first_message" is required.' });
+        }
+
+        const conversation = await conversationService.createConversation(projectId, first_message);
+        
+        // MODIFIED: Pass req and projectId to the stream handler
+        await streamResponse(req, res, conversation.id, projectId);
+
+    } catch (error) {
+        if (!res.headersSent) {
+          next(error);
+        } else {
+          console.error("Error after headers sent in createConversation:", error);
+          if (!res.writableEnded) {
+            res.end();
+          }
+        }
+    }
+}
+
+// addMessageToConversation function (unchanged)
+export async function addMessageToConversation(req: Request, res: Response, next: NextFunction) {
+    // ... (previous code)
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const conversationId = parseInt(req.params.conversationId, 10);
+        const { message } = req.body;
+
+        if (!message) {
+            return res.status(400).json({ error: 'A "message" is required.' });
+        }
+        
+        await conversationService.addUserMessage(conversationId, message);
+        
+        // MODIFIED: Pass req and projectId to the stream handler
+        await streamResponse(req, res, conversationId, projectId);
+
+    } catch (error) {
+         if (!res.headersSent) {
+          next(error);
+        } else {
+          console.error("Error after headers sent in addMessageToConversation:", error);
+          if (!res.writableEnded) {
+            res.end();
+          }
+        }
+    }
+}
+
+
+// listConversations function (unchanged)
+export async function listConversations(req: Request, res: Response, next: NextFunction) {
+    // ... (previous code)
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const conversations = await conversationService.listConversations(projectId);
+        res.json(conversations);
+    } catch (error) {
+        next(error);
+    }
+}
+
+// getConversation function (unchanged)
+export async function getConversation(req: Request, res: Response, next: NextFunction) {
+    // ... (previous code)
+    try {
+        const conversationId = parseInt(req.params.conversationId, 10);
+        const messages = await conversationService.getConversationMessages(conversationId);
+        res.json(messages);
+    } catch (error) {
+        next(error);
+    }
+}
+
+// NEW: Controller for capturing knowledge
+export async function captureKnowledge(req: Request, res: Response, next: NextFunction) {
+    try {
+        const projectId = parseInt(req.params.projectId, 10);
+        const conversationId = parseInt(req.params.conversationId, 10);
+
+        const result = await conversationService.captureKnowledgeFromConversation(projectId, conversationId);
+
+        if (!result) {
+            return res.status(200).json({ message: 'No significant knowledge was found to capture.' });
+        }
+
+        res.status(201).json({ message: 'Knowledge captured successfully.', knowledgeNote: result });
+
+    } catch (error) {
+        next(error);
+    }
+}
+
+--- FILE: api/conversations/conversation.routes.ts ---
+
+// --- FILE: api/conversations/conversation.routes.ts ---
+import { Router } from 'express';
+import * as conversationController from './conversation.controller';
+
+// mergeParams is crucial for nested routes to access parent params like :projectId
+const router = Router({ mergeParams: true });
+
+router.post('/', conversationController.createConversation);
+router.get('/', conversationController.listConversations);
+router.get('/:conversationId', conversationController.getConversation);
+router.post('/:conversationId/messages', conversationController.addMessageToConversation);
+
+// NEW: Route to trigger the knowledge capture process for a conversation.
+router.post('/:conversationId/capture-knowledge', conversationController.captureKnowledge);
+
+export default router;
+
+--- FILE: api/conversations/conversation.service.ts ---
+
+// --- FILE: api/conversations/conversation.service.ts ---
+import pool from '../../services/db';
+import * as openAI from '../../services/openai';
+import pgvector from 'pgvector/pg';
+import { Source } from '../projects/qa.service'; // Import the Source type
+
+/**
+ * Creates a new conversation and its first user message in the database.
+ * @param projectId The ID of the project.
+ * @param firstMessage The content of the user's first message.
+ * @returns The newly created conversation object.
+ */
+export async function createConversation(projectId: number, firstMessage: string) {
+    const client = await pool.connect();
+    try {
+        await client.query('BEGIN');
+
+        // Generate a title from the first message
+        const title = firstMessage.length > 80 ? firstMessage.substring(0, 77) + '...' : firstMessage;
+
+        const convResult = await client.query(
+            'INSERT INTO conversations (project_id, title) VALUES ($1, $2) RETURNING *',
+            [projectId, title]
+        );
+        const conversation = convResult.rows[0];
+
+        await client.query(
+            `INSERT INTO conversation_messages (conversation_id, role, content) VALUES ($1, 'user', $2)`,
+            [conversation.id, firstMessage]
+        );
+
+        await client.query('COMMIT');
+        return conversation;
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error('Error creating conversation:', error);
+        throw error;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Adds a new user message to an existing conversation.
+ * @param conversationId The ID of the conversation.
+ * @param message The content of the user's message.
+ */
+export async function addUserMessage(conversationId: number, message: string) {
+    const client = await pool.connect();
+    try {
+        await client.query(
+            `INSERT INTO conversation_messages (conversation_id, role, content) VALUES ($1, 'user', $2)`,
+            [conversationId, message]
+        );
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Adds an assistant's response to a conversation.
+ * @param conversationId The ID of the conversation.
+ * @param content The full text content of the assistant's reply.
+ * @param sources The sources cited in the reply.
+ */
+export async function addAssistantMessage(conversationId: number, content: string, sources: any) {
+    const client = await pool.connect();
+    try {
+        await client.query(
+            `INSERT INTO conversation_messages (conversation_id, role, content, sources) VALUES ($1, 'assistant', $2, $3)`,
+            [conversationId, content, JSON.stringify(sources)]
+        );
+        // Also update the conversation's updated_at timestamp
+        await client.query('UPDATE conversations SET updated_at = NOW() WHERE id = $1', [conversationId]);
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Lists all conversations for a given project.
+ * @param projectId The ID of the project.
+ */
+export async function listConversations(projectId: number) {
+    const client = await pool.connect();
+    try {
+        const { rows } = await client.query(
+            'SELECT id, title, updated_at FROM conversations WHERE project_id = $1 ORDER BY updated_at DESC',
+            [projectId]
+        );
+        return rows;
+    } finally {
+        client.release();
+    }
+}
+
+/**
+ * Retrieves all messages for a single conversation.
+ * @param conversationId The ID of the conversation.
+ */
+export async function getConversationMessages(conversationId: number) {
+    const client = await pool.connect();
+    try {
+        const { rows } = await client.query(
+            'SELECT * FROM conversation_messages WHERE conversation_id = $1 ORDER BY created_at ASC',
+            [conversationId]
+        );
+        return rows;
+    } finally {
+        client.release();
+    }
+}
+
+// NEW: The core "learning" function.
+export async function captureKnowledgeFromConversation(projectId: number, conversationId: number): Promise<{ id: number; summary: string } | null> {
+    const client = await pool.connect();
+    try {
+        const messages = await getConversationMessages(conversationId);
+        if (messages.length < 2) { // Need at least one user message and one assistant reply
+            return null;
+        }
+
+        const transcript = messages.map(m => `${m.role.toUpperCase()}:\n${m.content}`).join('\n\n---\n\n');
+
+        const systemPrompt = `You are an AI assistant that distills key decisions and summaries from engineering conversations. Analyze the following transcript and extract the single most important decision, technical summary, or architectural choice. The summary MUST be a concise, one-sentence statement. If no clear decision was made or the conversation is trivial, respond with the exact string "NULL".
+
+Example outputs:
+- "Decision: The JWT expiration will be changed from 1 hour to 24 hours to improve user experience."
+- "Conclusion: The ingestion pipeline performance issue is caused by a missing index on the 'commits' table."
+- "Architectural Choice: A queueing system will be implemented using 'p-queue' to manage concurrent ingestion tasks."`;
+        
+        const userPrompt = `CONVERSATION TRANSCRIPT:\n\n${transcript}`;
+
+        const summary = await openAI.getChatCompletion([
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt }
+        ]);
+
+        if (!summary || summary.trim().toUpperCase() === 'NULL') {
+            console.log(`AI determined no knowledge could be captured from conversation ${conversationId}.`);
+            return null;
+        }
+        
+        await client.query('BEGIN');
+        
+        const embedding = await openAI.getEmbedding(summary);
+
+        const noteResult = await client.query(
+            'INSERT INTO knowledge_notes (project_id, conversation_id, note_summary, embedding) VALUES ($1, $2, $3, $4) RETURNING id',
+            [projectId, conversationId, summary, pgvector.toSql(embedding)]
+        );
+        const knowledgeNoteId = noteResult.rows[0].id;
+        
+        // --- Link the knowledge to its sources ---
+        const allSources: Source[] = messages
+            .filter(m => m.role === 'assistant' && m.sources)
+            .flatMap(m => m.sources);
+        
+        const uniqueSources = Array.from(new Map(allSources.map(s => [`${s.type}:${s.id}`, s])).values());
+
+        for (const source of uniqueSources) {
+            if (source.type === 'code') {
+                const { rows } = await client.query('SELECT id FROM indexed_files WHERE path = $1 AND project_id = $2', [source.id, projectId]);
+                if (rows.length > 0) {
+                    await client.query('INSERT INTO knowledge_note_links (knowledge_note_id, file_id) VALUES ($1, $2)', [knowledgeNoteId, rows[0].id]);
+                }
+            } else if (source.type === 'task') {
+                 const { rows } = await client.query('SELECT id FROM tasks WHERE task_number = $1 AND project_id = $2', [source.id, projectId]);
+                 if (rows.length > 0) {
+                    await client.query('INSERT INTO knowledge_note_links (knowledge_note_id, task_id) VALUES ($1, $2)', [knowledgeNoteId, rows[0].id]);
+                }
+            }
+            // Add linking for commits, documents, etc. in the same fashion if needed
+        }
+
+        await client.query('COMMIT');
+
+        console.log(`Successfully captured knowledge note ${knowledgeNoteId} from conversation ${conversationId}.`);
+        return { id: knowledgeNoteId, summary };
+
+    } catch (error) {
+        await client.query('ROLLBACK');
+        console.error(`Failed to capture knowledge from conversation ${conversationId}:`, error);
+        throw error;
+    } finally {
+        client.release();
     }
 }
 
@@ -1920,6 +2291,13 @@ if (!openaiApiKey) {
 
 const openai = new OpenAI({ apiKey: openaiApiKey });
 
+// NEW: Define a reusable type for chat messages
+export interface ChatMessage {
+    role: 'system' | 'user' | 'assistant';
+    content: string;
+}
+
+
 export async function getEmbedding(text: string): Promise<number[]> {
   const response = await openai.embeddings.create({
     model: 'text-embedding-3-small',
@@ -1928,12 +2306,22 @@ export async function getEmbedding(text: string): Promise<number[]> {
   return response.data[0].embedding;
 }
 
-export async function getChatCompletionStream(systemPrompt: string, userPrompt: string) {
+// MODIFIED: This function now accepts a flexible array of messages
+export async function getChatCompletionStream(messages: ChatMessage[]) {
     return openai.chat.completions.create({
         model: 'gpt-4o',
-        messages: [{ role: 'system', content: systemPrompt }, { role: 'user', content: userPrompt }],
+        messages: messages,
         stream: true,
     });
+}
+
+// NEW: A non-streaming version for tasks like summarization.
+export async function getChatCompletion(messages: ChatMessage[]): Promise<string | null> {
+    const response = await openai.chat.completions.create({
+        model: 'gpt-4o',
+        messages: messages,
+    });
+    return response.choices[0].message.content;
 }
 
 --- FILE: services/queue.service.ts ---

@@ -60,3 +60,17 @@ export async function deleteTask(req: Request, res: Response, next: NextFunction
         next(error);
     }
 }
+
+// --- NEW: Controller for the context bundle ---
+export async function getTaskContextBundle(req: Request, res: Response, next: NextFunction) {
+    try {
+        const { projectId, taskNumber } = req.params;
+        const bundle = await taskService.getContextBundleForTask(
+            parseInt(projectId, 10),
+            parseInt(taskNumber, 10)
+        );
+        res.json(bundle);
+    } catch (error) {
+        next(error);
+    }
+}
